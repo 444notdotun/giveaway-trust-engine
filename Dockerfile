@@ -34,6 +34,8 @@ WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 
 ARG COMMIT_SHA
+LABEL org.opencontainers.image.source="https://github.com/444notdotun/giveaway-trust-engine" \
+      org.opencontainers.image.revision="${COMMIT_SHA}"
 ENV APP_COMMIT_SHA=${COMMIT_SHA}
 
 USER appuser
