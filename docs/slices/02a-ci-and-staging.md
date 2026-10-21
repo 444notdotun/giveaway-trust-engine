@@ -1,0 +1,175 @@
+# Slice 2a: CI and staging deploy
+
+CRITICAL REVIEW. PRD refs: Section 13 (Environments — staging is a real deployed Render free-tier service, cold-start accepted, no keep-alive cron), Section 14 (Observability — structured JSON logs, requestId), Section 18 (Bachs/Supabase details still unverified). BUILD_ORDER item 2a, inserted after slice 2 (startup guard) and before slice 3 (auth).
+
+**Slice 11 ("Release") is shrunk to production-only in BUILD_ORDER.md as part of this edit.** It previously duplicated this slice's scope (Dockerfile, CI, staging deploy); now that 2a covers that, slice 11 is just promoting the same already-proven GHCR image to a production Render service, plus production-specific env vars/secrets, plus re-proving the startup guard's PRODUCTION-side refusal case the same way staging's refusal gets proven here.
+
+## 1. Dockerfile
+
+Multi-stage, two stages:
+
+**Both stages pin an exact Java 25 tag, never a floating major-version tag.** `eclipse-temurin:25-jdk-jammy` and `eclipse-temurin:25-jre-jammy` both float — they resolve to whatever the latest 25.x patch is on build day, so the same Dockerfile can silently build a different JVM patch version next week with no change to this repo. Pin the exact patch tag (e.g. `eclipse-temurin:25.0.1_9-jdk-jammy`, matched by an equally exact `-jre-jammy` tag for the runtime stage) — **the specific patch number is not looked up here and must not be guessed into this doc as final; confirm the current exact tag against Eclipse Temurin's published tag list at implementation time**, then pin it. Ideally pin by digest (`@sha256:...`) as well as tag for full reproducibility, since tags (even specific-looking ones) can technically be moved; the digest can't.
+
+**Build stage**: the pinned JDK tag. Copies `pom.xml` and `.mvn/`/`mvnw` first, runs `./mvnw -B dependency:go-offline` to cache dependencies in their own Docker layer before copying `src/`, then `./mvnw -B -DskipTests package` (tests already ran in CI's `verify` job — the Docker build doesn't need to re-run them).
+
+**Runtime stage**: the pinned JRE tag (JRE only, no JDK, no Maven, no build tools — smaller image, smaller attack surface). Creates a non-root user and group (e.g. `appuser`/`appgroup`, fixed low UID like 10001 so it's stable across rebuilds) and runs as that user via `USER appuser` — never root. Copies only the built JAR from the build stage (`COPY --from=build /app/target/*.jar app.jar`).
+
+**No secrets baked in.** The image contains no `.env` file, no database password, no Bachs credentials, nothing — every runtime value (datasource, Redis, `app.*` properties) comes from environment variables injected at container start (Render's env var UI), exactly as already true for local dev via `.env`. The Dockerfile itself references no secret-bearing build args.
+
+**`.dockerignore`** excludes `.env*` (every local env file, matching the same pattern the project's own guard hook already protects), `docs/PRD.md` (the PRD is internal planning material, not something that needs to ship inside a running container — it has no runtime purpose there and the repo being public doesn't mean every file belongs in every artifact built from it), `.git` (version history, irrelevant to the running app and needlessly large), and `target` (rebuilt fresh inside the build stage anyway; copying a stale local `target/` in would be a bug, not an optimization).
+
+**CI verifies the image actually contains neither file** — not just trusting `.dockerignore` to have worked. After building, a check step (e.g. `docker create` the image, `docker export` or `docker cp` out specific paths, or `docker run --rm <image> sh -c 'test -e /app/PRD.md -o -e /app/.env && exit 1 || exit 0'` adapted to wherever the app's working directory actually is once the Dockerfile is written) fails the image job if either `docs/PRD.md` or any `.env*` file is found anywhere in the built image's filesystem. This catches a `.dockerignore` mistake (wrong path, wrong glob) before it ships, rather than trusting the ignore file blindly.
+
+**Commit SHA on `/actuator/info`.** `ARG COMMIT_SHA` in the Dockerfile, passed by CI at build time (`docker build --build-arg COMMIT_SHA=${{ github.sha }} ...`), set as `ENV APP_COMMIT_SHA=${COMMIT_SHA}` in the runtime stage. `application.properties` gets `info.app.commit=${APP_COMMIT_SHA:unknown}` (defaulting to `unknown` only for local/dev runs built without the build arg — this default is safe precisely because it's not a security-relevant value, unlike the Bachs URLs or DB credentials, which still get no defaults) plus `management.info.env.enabled=true`, so `GET /actuator/info` on a running container shows which commit it's running — the thing an operator needs when diagnosing "is staging actually running what I just merged."
+
+**JVM memory flags, reasoned against the Render instance size.** PRD Section 13 confirms staging runs on Render's free tier. Render's published free-tier web service spec is 512 MB RAM / 0.1 shared CPU. A JVM needs headroom beyond the heap for metaspace, thread stacks, direct buffers (Hikari, Lettuce/Redis client), and JIT/GC bookkeeping — giving the heap the full 512 MB leaves no room for any of that and risks an OOM-killed container well before the JVM's own `-Xmx` is reached. Proposed flags: `-XX:MaxRAMPercentage=65.0 -XX:+UseSerialGC -Xss512k -XX:+ExitOnOutOfMemoryError`. Reasoning: `MaxRAMPercentage` (not a fixed `-Xmx`) lets the JVM size the heap relative to whatever container memory limit Render actually enforces, rather than a number hardcoded against an instance size that could change; 65% of 512 MB leaves roughly 180 MB for non-heap use, which is tight but workable for this app's current scope (no large in-memory caches yet); `SerialGC` over the default (likely G1) trades throughput for a much smaller fixed GC bookkeeping overhead, appropriate for a single-core, memory-constrained container, not a multi-core server; a smaller `-Xss` than the 1 MB default reduces per-thread stack cost, relevant since Tomcat's default thread pool could otherwise reserve more stack memory than this instance can spare; `ExitOnOutOfMemoryError` makes an OOM a clean, immediate JVM exit rather than a JVM left running in an unpredictable half-alive state after an `OutOfMemoryError` — Render's own process supervision then restarts the container the same way it would for any other crash, which is a known, recoverable failure mode, versus a hung process that still answers the liveness probe while unable to do real work. **This reasoning holds only if the free-tier spec is in fact 512 MB/0.1 CPU at implementation time** — Render's published specs are a point-in-time fact, not something this doc re-verifies live; confirm against Render's current docs before implementing, and adjust the percentage/flags if the actual instance differs.
+
+**Render's port.** Render injects a `PORT` environment variable into every web service container and routes external traffic to whatever port the container actually listens on — it does not assume 8080 or any other fixed port. `application.properties` gets `server.port=${PORT:8080}`, not a Render dashboard variable hardcoding `PORT=8080`. Reasoning: binding `server.port` to read `PORT` is the mechanism Render's own platform expects (the app must listen on *whatever* `PORT` Render hands it, since that value isn't guaranteed to stay 8080), while the `:8080` fallback keeps local dev and `docker-compose` working unchanged, since nothing sets `PORT` in those contexts. Setting `PORT=8080` as a Render env var instead would work today only because Render's current default happens to be 8080 — it reproduces a default Render already provides rather than actually reading the value Render sets, and would silently break if Render ever assigned a different port.
+
+## 2. GitHub Actions: `verify` job on pull requests
+
+`.github/workflows/ci.yml`, triggered on `pull_request` (and reasonably also `push` to `main`, so merges without a PR still get checked — but the required check for branch protection is specifically named `verify`, matching CLAUDE.md's "Full check, run before any PR: `./mvnw -B verify`").
+
+- Runs `./mvnw -B verify` — same command this project already treats as the gate for every slice.
+- Docker is available on GitHub's standard `ubuntu-latest` runners (Docker Engine pre-installed), which Testcontainers needs. **Must check the Docker API version handling against `src/test/resources/docker-java.properties`** (currently pinned to `api.version=1.44` to work around this *local dev sandbox's* specific Docker daemon rejecting Testcontainers' default shaded client version — see slice 1). GitHub-hosted runners' Docker daemon version is Ubuntu's current stable Docker Engine, which is very likely compatible with Testcontainers' own default client version already (this pin was a local-environment workaround, not a universal requirement) — but this must be confirmed by actually running the workflow once implemented, not assumed. If the GitHub runner's daemon also rejects the default client version, the same `docker-java.properties` pin already covers it since it ships in the test resources and applies wherever the tests run; if the runner's daemon is fine without it, the pin is harmless (it only requests a specific, still-valid client API version) and needs no runner-specific branching.
+- Maven dependency cache via `actions/cache` (or `actions/setup-java`'s built-in `cache: maven` option) keyed on `pom.xml`'s hash, so dependency resolution doesn't re-download on every run.
+- Job name: **`verify`** exactly — this is what branch protection's "require status checks to pass" setting needs to match, so renaming it later silently breaks branch protection.
+- **No secrets in the workflow.** This `verify` job needs no secrets at all: Testcontainers starts its own Postgres/Redis containers (same self-contained pattern already used throughout this test suite since slice 1/2 — no `.env`, no real Supabase, no real Bachs URLs required to run `verify`). If a secret were ever needed here, it would be a sign the tests had stopped being self-contained, which is itself worth noticing.
+- **Explicit `permissions:` block on this job** (`contents: read` — the only thing `verify` actually needs), rather than relying on the workflow's or the repo's default token permissions, which are typically broader than any one job needs. Every job in this workflow gets its own explicit `permissions:` block sized to what that specific job does, not a single blanket grant at the workflow level.
+
+## 3. Build once, promote everywhere: GHCR on merge to `main`
+
+A second job (or a separate workflow triggered on `push` to `main`, gated on the `verify` job's success) builds the Docker image **once** and tags it **only** with the merge commit's SHA (`ghcr.io/444notdotun/giveaway-trust-engine:<sha>`) — **no `:latest` tag, at all.** `:latest` is a floating pointer: anything consuming it can't know which commit it actually got without separately checking, which is exactly the ambiguity Section 4's deploy mechanism below is designed to avoid. Every deploy, staging or production, references the exact SHA tag CI just built, never a mutable alias.
+
+**The job fails if `COMMIT_SHA` is empty.** The build-arg value (`${{ github.sha }}` in the normal case) is checked explicitly before the `docker build` step runs — an empty value would still produce an image (Docker doesn't require a build arg to be non-empty), just one silently missing the `/actuator/info` commit identification this whole mechanism exists to provide, and that failure mode should be loud, not a blank field someone notices days later.
+
+**The same image is promoted to every environment from that point on — staging now, production later — never rebuilt per environment.** This is the whole point of "build once, promote": whatever staging tested is bit-for-bit what reaches production, no risk of an environment-specific build difference.
+
+**Image visibility: public.** The repository is already public, and per the Dockerfile section above, no secrets are baked into the image. Making the GHCR package public too (a one-time setting in the package's own visibility settings, not something CI can force on first push — the package inherits GHCR's default *private* visibility on first publish regardless of the source repo's visibility, so this needs a manual one-time click after the first image lands) removes an entire category of deploy friction: Render can pull a public image with no registry credentials configured at all, and there's no `GHCR_TOKEN`-shaped secret to manage, rotate, or accidentally leak in a Render env var. Keeping it private would require generating and storing a GitHub PAT (or a GHCR-scoped token) as a Render secret for no real benefit, since there's nothing secret in the image to protect.
+
+**This job's permissions block**: `contents: read, packages: write` — read to check out the repo, write to push to GHCR, nothing broader.
+
+**After the push succeeds, this job triggers the staging deploy itself**, via a Render deploy hook URL stored as a GitHub Actions secret (`RENDER_STAGING_DEPLOY_HOOK`, or similar — never hardcoded in the workflow file).
+
+**The deploy hook carries the exact SHA tag via the `imgURL` query parameter — verified against Render's own docs, not assumed.** Per [Render's Deploy Hooks documentation](https://render.com/docs/deploy-hooks): "Image-backed services... do not automatically redeploy if a new image is pushed to the registry, but you can use a deploy hook to trigger a deploy whenever an updated image is available... To deploy a specific tag or digest, append the `imgURL` query parameter to your deploy hook URL. If you don't provide this parameter, Render uses whichever tag or digest you've specified in the service's settings... Render's deploy hook `imgURL` applies to that one deploy only" — it does not persist as the service's new default. Concretely, the CI job calls something shaped like:
+
+```
+https://api.render.com/deploy/srv-XXXXX?key=XXXXX&imgURL=ghcr.io%2F444notdotun%2Fgiveaway-trust-engine%40sha256%3A<digest>
+```
+
+(URL-encoded; Render's own example uses a digest form, `repo@sha256:...`, rather than a `:tag` form, in the sample it documents — resolve the pushed image's digest in the CI job, not just its tag string, and URL-encode the whole `imgURL` value before appending it to the hook). This replaces the earlier hedge in this doc about whether a separate API call would be needed to update the service's configured image first — it isn't: the one hook call, with `imgURL` set, is sufficient for that single deploy.
+
+## 4. Staging deploy on Render, from the image tag
+
+**The Render staging service must be created as "Deploy an existing image"** — this is a one-time manual setup step in Render's own dashboard (choosing that service type when the service is first created), not something this repo's CI can provision or automate; CI only ever triggers deploys of an already-existing service, it doesn't create one. This matters specifically because Render's other service types (deploy from a connected Git repo, build from a Dockerfile Render builds itself) don't support the `imgURL` deploy-hook parameter the way "deploy an existing image" does — picking the wrong service type at creation time would break the exact-SHA-tag deploy mechanism this slice depends on.
+
+Per Section 3 above, the deploy is triggered by the image-build job itself calling a Render deploy hook URL (kept as a GitHub Actions secret) immediately after pushing the new SHA-tagged image — not a separate manual step, and not Render polling for new tags on its own.
+
+**Environment variables**, every one of the ten needed, by name only:
+
+| Variable | Secret? | Notes |
+|---|---|---|
+| `DB_HOST` | No | Supabase host, not sensitive on its own |
+| `DB_PORT` | No | |
+| `POSTGRES_DB` | No | Database name |
+| `POSTGRES_USER` | No | A username alone isn't credential material; still Render-managed rather than hardcoded, since it's project-specific config |
+| `POSTGRES_PASSWORD` | **Yes** | Real database credential |
+| `REDIS_HOST` | No | |
+| `REDIS_PORT` | No | |
+| `APP_ENVIRONMENT` | No | Literal value `STAGING` |
+| `BACHS_SANDBOX_BASE_URL` | No | Public API base URL, not a secret (per slice 2's decision) |
+| `BACHS_LIVE_BASE_URL` | No | Same |
+| `BACHS_BASE_URL` | No | Set to the **sandbox** value on staging — the startup guard requires STAGING to resolve to SANDBOX mode, or the service refuses to start |
+
+Names verified directly against the files that actually consume them, not recalled from memory:
+
+```
+$ grep -n "app\.\|\${" src/main/resources/application.properties
+spring.datasource.url=jdbc:postgresql://${DB_HOST}:${DB_PORT}/${POSTGRES_DB}
+spring.datasource.username=${POSTGRES_USER}
+spring.datasource.password=${POSTGRES_PASSWORD}
+spring.data.redis.host=${REDIS_HOST}
+spring.data.redis.port=${REDIS_PORT}
+app.environment=${APP_ENVIRONMENT}
+app.bachs.sandbox-base-url=${BACHS_SANDBOX_BASE_URL}
+app.bachs.live-base-url=${BACHS_LIVE_BASE_URL}
+app.bachs.base-url=${BACHS_BASE_URL}
+
+$ cat .env.example
+POSTGRES_DB=giveaway
+DB_HOST=localhost
+DB_PORT=5433
+POSTGRES_USER=giveaway
+POSTGRES_PASSWORD=.....
+REDIS_PORT=6380
+REDIS_HOST=localhost
+APP_ENVIRONMENT=DEV
+BACHS_SANDBOX_BASE_URL=https://sandbox-api.bachs.io
+BACHS_LIVE_BASE_URL=https://api.bachs.io
+BACHS_BASE_URL=https://sandbox-api.bachs.io
+```
+
+The three Bachs variables are `BACHS_SANDBOX_BASE_URL` / `BACHS_LIVE_BASE_URL` / `BACHS_BASE_URL` in both files — no `APP_` prefix on them anywhere in the actual config (only `app.bachs.*` on the Spring *property* side, which is a different namespace from the env var name it reads from). The table above already matches this exactly.
+
+**Open item, not guessed**: if Render's own managed Redis (or whichever Redis provider staging actually uses) requires authentication, there's a twelfth variable (something like `REDIS_PASSWORD`) not listed above, because it isn't confirmed which Redis offering staging uses or whether it's the same unauthenticated setup as local `docker-compose.yaml`. Confirm before implementing; don't invent the variable name speculatively.
+
+**Health check path: liveness only, never the aggregate `/actuator/health`.** Add `management.endpoint.health.probes.enabled=true` (Spring Boot's Kubernetes-style liveness/readiness split, which works the same under Render's own health-check mechanism) and point Render's health check at `/actuator/health/liveness`, not `/actuator/health`. Reasoning: the aggregate endpoint's status depends on every registered `HealthIndicator`, including the datasource and Redis — a transient Supabase or Redis hiccup would flip the aggregate endpoint unhealthy and could cause Render to restart an otherwise-fine running instance for a problem a restart can't fix. Liveness should only answer "is this JVM alive and able to serve," which is what should gate a restart decision; readiness (not currently wired to anything, since there's no load balancer stepping traffic in/out of multiple instances yet at this project's scale) is the more appropriate place for datasource/Redis health, if that's ever needed later.
+
+## 5. Database access: session-mode pooler, for both Flyway and the app
+
+**Decision, superseding slice 1's earlier claim**: slice 1's plan said "Flyway needs the Supabase direct connection string, not the pooler." That claim is withdrawn here. Both Flyway's migration step and the running app's ordinary query traffic use the same connection: Supabase's **session-mode** pooler (Supavisor), not a direct connection, and not transaction mode.
+
+- Host: `aws-0-eu-west-1.pooler.supabase.com`
+- Port: `5432` (session mode's port — Supavisor's transaction-mode pooler listens on `6543` instead; using `5432` is itself part of what selects session mode, not just a connection detail)
+- User: `postgres.<project-ref>` (the pooler-specific username format, not the plain `postgres` user a direct connection would use)
+
+Why session mode specifically, for both Flyway and the app, on one connection: session mode holds a dedicated backend connection for the life of the client session, which means it behaves like a direct connection for everything the JDBC driver, Hikari, and Flyway care about — server-side prepared statements, session-level state, multi-statement migration scripts — with none of transaction mode's restrictions. That removes the entire direct-vs-pooler split this doc previously carried: no separate connection string for migrations, no `prepareThreshold=0` workaround, no reduced Hikari pool sizing to avoid fighting the pooler's own multiplexing (transaction mode's concerns, not session mode's). One connection string, one mental model, for both the one-time migration step and the app's steady-state traffic.
+
+**This decision is unproven until the first staging deploy's logs confirm it.** Nothing here has been verified against a real Supabase project yet — not that this exact hostname format is correct for this project's actual region/project-ref, not that session mode actually behaves as described against Supabase's current Supavisor version, not that Flyway's migration run actually succeeds through it. The first staging deploy is the proof: Flyway's own startup log lines (already present via `org.flywaydb.core.internal.command.DbMigrate`, as seen in every Testcontainers-backed test since slice 1) either show a clean migrate-and-succeed, which proves this decision, or an error, which disproves it and sends this back to direct-connection-for-Flyway or transaction-mode-with-workarounds. Mark this decision **unproven** until that first deploy log is read; don't treat it as settled before then.
+
+## 6. Redis on staging: noeviction, timeouts, graceful shutdown
+
+**`noeviction`** is already CLAUDE.md's stated policy (and already configured in local `docker-compose.yaml`'s `redis-server --maxmemory-policy noeviction`) — staging's Redis, whatever the actual provider turns out to be, needs the same policy so a Redis OOM at the max-memory limit rejects writes loudly (an error the app would need to handle, likely surfacing as the resolve-endpoint 503 the PRD already specifies for a Redis outage) rather than silently evicting the revoked-session set or any other key, which would be a security problem (a revoked session key silently evicted means a stolen token stops being revoked).
+
+**Every timeout set explicitly**, matching the existing local config's intent (`spring.data.redis.timeout=2000` already exists in `application.properties`) carried through to staging unchanged, plus whatever connection-establishment timeout the Lettuce client needs configured (`spring.data.redis.lettuce.*` properties, to be confirmed at implementation) so a Redis connectivity problem fails fast rather than hanging a request thread.
+
+**Graceful shutdown window, reasoned against Render's own shutdown window.** Spring Boot's `server.shutdown=graceful` plus `spring.lifecycle.timeout-per-shutdown-phase` controls how long the app waits for in-flight requests to finish before forcing shutdown on SIGTERM. This must be set shorter than whatever window Render actually gives a container between sending SIGTERM and forcibly killing it (SIGKILL) during a deploy or restart — **Render's exact shutdown grace period is not confirmed and is listed as an open item below, not guessed.** Once that number is known, the graceful-shutdown timeout should be set comfortably under it (e.g. a few seconds of margin), so Spring Boot's own graceful drain always has a chance to finish before Render's harder kill, rather than racing it.
+
+## 7. Failure cases to prove on staging
+
+Not just unit-tested in isolation (slice 2 already covers the startup guard's logic exhaustively) — these need an actual demonstration against the real deployed staging service, since that's the thing this slice is building:
+
+1. **Wrong Bachs URL makes the app refuse to start.** Temporarily set staging's `BACHS_BASE_URL` to the real live URL (`https://api.bachs.io`) while `APP_ENVIRONMENT=STAGING` — the deploy must fail, with the startup guard's `StartupGuardException` message visible in Render's log stream, naming `STAGING` and the mismatch. Revert immediately after confirming.
+2. **A missing env var fails at startup with the property named.** Temporarily unset one required var (e.g. `APP_ENVIRONMENT` itself) and redeploy — must fail with a message naming that exact property (`app.environment is required`), not a generic binding stack trace. This is exactly the Render-shaped bug slice 2's review round already found and fixed in the guard itself; this is proving that fix against the real platform, not just the test suite.
+3. **A failing migration stops the deploy and the old version keeps serving.** This leans on Render's own standard deploy behavior for web services (the new instance must pass its health check before Render cuts traffic over to it; if the new instance never becomes healthy, Render keeps routing to the previous instance and marks the deploy failed) rather than anything this slice needs to build itself — Flyway already refuses to let the app start on a migration failure (an un-migratable schema state means `DbValidate`/`DbMigrate` throws during the same early startup phase the guard occupies, before the app is ever marked healthy). Proven with a **deliberately failing throwaway migration on a branch** (never merged to `main`) — e.g. a `V99__deliberately_broken.sql` with a SQL error, deployed to staging once from that branch. Confirm two things, not just one: Render reports the deploy failed and staging keeps serving the previous build throughout (the platform-level claim), **and** `flyway_schema_history` records nothing at all for the failed attempt — no row, not even one marked `success = false`. This second check is specifically a Postgres behavior worth stating explicitly: Postgres supports transactional DDL, and Flyway wraps each migration (including the history-table insert that records it) in one transaction by default, so a mid-script failure rolls back the schema change *and* the history insert together — the database ends up exactly as if the attempt never happened, not left with a visible "failed" audit row the way some non-transactional databases would leave one. Delete the throwaway branch after confirming both.
+
+**Deploying a throwaway branch like this needs a manual trigger** — the normal CI flow (Section 3) only builds and deploys on merge to `main`, and this migration must never reach `main`. A separate `.github/workflows/deploy-branch-to-staging.yml`, triggered only by `workflow_dispatch` with a `branch` input (the branch to build and deploy), covers this and any other future need to push an arbitrary branch to staging for manual verification. Two restrictions, both load-bearing:
+- **Repo-owner only.** The job's first step checks `github.actor` against the repository owner (e.g. `if: github.actor == github.repository_owner`, failing/skipping the rest of the job otherwise) — `workflow_dispatch` is already restricted to users with write access to the repo by GitHub's own permission model, but this adds an explicit second gate so "anyone with write access" doesn't silently become "anyone who can push a branch and deploy it to staging," which is a wider blast radius than intended for what's meant to be an occasional manual escape hatch, not a general-purpose deploy-any-branch tool.
+- **No secrets evaluated on `pull_request` events, anywhere in this repo's workflows — stated explicitly as a repo-wide rule, not just for this new workflow.** This new `workflow_dispatch` workflow only ever runs on an explicit manual trigger, never on `pull_request`, so it doesn't need this rule stated for itself specifically — but it's worth stating here because this is the slice introducing the repo's first workflows that hold real secrets (the GHCR push token and the Render deploy hook URL), and the rule needs to hold across all of them, including the ones built later in Section 2/3: a `pull_request` trigger must never be in the same job (or workflow) as a step that references `secrets.*`, including from a same-repo contributor's branch, as defense in depth beyond GitHub's own fork-PR secret restrictions.
+
+## 8. Structured logs and requestId — moved to slice 2b
+
+CLAUDE.md requires "Structured JSON logs with giveawayId in the MDC, plus a requestId per request" for every slice, and this is correctly flagged as missing today — right now the app logs via Logback's bare default fallback pattern (plain text, confirmed back in slice 2's review when captured test output was inspected directly), not JSON, and nothing populates any MDC key for any request.
+
+This no longer lands in 2a. BUILD_ORDER now has a dedicated **slice 2b, "Structured logging"**, inserted immediately after this slice: Spring Boot's own **built-in** structured logging support (`logging.structured.format.console=...`, no new dependency — Boot 4.1 ships this natively, so there's no need for `logstash-logback-encoder` or any third-party encoder); a requestId that's either generated server-side or, if accepted from an inbound header, sanitized first (length-capped, charset-restricted — never trusted as opaque client input straight into the MDC or a log line), placed in the MDC for the duration of the request, and returned as a response header so a caller can correlate their own request against server-side logs. `giveawayId` in the MDC stays deferred to slice 5, same reasoning as before: there's no giveaway to tag until that slice creates the first one. Full plan for 2b gets written when that slice is actually planned, not here.
+
+## Open items — not guessed, listed here per CLAUDE.md and this slice's own instruction
+
+| Item | Why it's open |
+|---|---|
+| **Supabase Postgres major version** | Not confirmed which Postgres major version the actual Supabase staging/production projects run. Affects nothing in this slice's own code, but matters for anyone later relying on a Postgres-version-specific feature; flagged rather than assumed. |
+| **Pool sizes** (Hikari max pool size for the app's own connections against the session-mode pooler, and whatever connection limit Supavisor itself enforces per project) | Section 5 now decides *which* connection (session-mode pooler) but not *how many* connections the app should hold open against it. Already a standing never-guess item in CLAUDE.md's "Open items" list; restated here because this slice is where it would otherwise get silently decided. |
+| **Render's shutdown grace window** (SIGTERM-to-SIGKILL duration) | Needed to set a correct graceful-shutdown timeout in Section 6; not looked up/confirmed here. Already a standing CLAUDE.md never-guess item. |
+| **Staging's actual Redis provider and whether it requires auth** | Section 4's env var table may be missing a `REDIS_PASSWORD`-shaped variable depending on the answer; not confirmed. |
+| **Exact Render free-tier instance spec at implementation time** | Section 1's JVM memory flags are reasoned against Render's *currently documented* 512 MB/0.1 CPU free-tier spec per PRD Section 13, but Render's offering could change between this doc and implementation; worth a quick re-check, not re-litigating the whole JVM tuning approach if it hasn't. |
+
+## Closing status, one line per numbered item
+
+1. **Dockerfile** (multi-stage, pinned exact Java 25 tags, non-root, no secrets, commit-SHA guard, `.dockerignore` + CI content check, port via `${PORT:8080}`, `ExitOnOutOfMemoryError`) — planned.
+2. **GitHub Actions `verify` job** (Testcontainers, Maven cache, named `verify`, no secrets, explicit `permissions: contents: read`) — planned.
+3. **GHCR build-once-promote-everywhere** (SHA tag only, no `:latest`, fails on empty `COMMIT_SHA`, `permissions: contents: read, packages: write`, triggers the Render deploy hook via the `imgURL` parameter — cited against Render's own docs — after push) — planned.
+4. **Staging on Render** (service created as "Deploy an existing image", confirmed required for `imgURL` support) — planned, with one sub-item open (possible `REDIS_PASSWORD`, pending Redis provider confirmation).
+5. **Database access, session-mode pooler for both Flyway and the app** — planned (decided, superseding slice 1's direct-connection claim), but explicitly **unproven** until the first staging deploy's Flyway log confirms it actually works against the real Supabase project.
+6. **Redis noeviction/timeouts/shutdown** — open: Render's shutdown grace window not confirmed, so the graceful-shutdown timeout number can't be finalized; the noeviction policy and the need for explicit timeouts are otherwise planned.
+7. **Failure cases to prove on staging** (wrong Bachs URL, missing env var, failing migration incl. `flyway_schema_history` recording nothing, via a repo-owner-only `workflow_dispatch` workflow for deploying a throwaway branch) — planned.
+8. **Structured logs + requestId** — not done in this slice; moved to new BUILD_ORDER slice 2b (Spring Boot's built-in structured logging, sanitized/server-generated requestId, response header). `giveawayId` MDC stays deferred to slice 5 regardless of which slice ships the rest.
