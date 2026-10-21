@@ -18,7 +18,8 @@ RUN ./mvnw -B dependency:go-offline
 COPY src/ src/
 
 ARG COMMIT_SHA
-RUN test -n "$COMMIT_SHA" || (echo "COMMIT_SHA build arg is required and must not be empty" >&2 && exit 1)
+RUN echo "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+    || (echo "COMMIT_SHA build arg must be exactly 40 lowercase hex characters (a full git SHA), got: '$COMMIT_SHA'" >&2 && exit 1)
 
 RUN ./mvnw -B -DskipTests package
 

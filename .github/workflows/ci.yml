@@ -39,3 +39,76 @@ jobs:
           name: surefire-reports
           path: target/surefire-reports/**
           if-no-files-found: ignore
+
+  image:
+    name: image
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/444notdotun/giveaway-trust-engine
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Validate COMMIT_SHA is exactly 40 lowercase hex characters
+        run: |
+          sha="${{ github.sha }}"
+          if ! echo "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "github.sha did not resolve to a 40-character lowercase hex SHA: '$sha'" >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image locally -- NOT pushed yet, content check must pass first
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Export the local image's filesystem for the content check
+        run: |
+          container_id=$(docker create "${{ env.IMAGE }}:${{ github.sha }}")
+          docker export "$container_id" -o image.tar
+          docker rm "$container_id"
+          mkdir -p image-fs
+          tar -xf image.tar -C image-fs
+
+      - name: Fail if the image contains .env* or PRD.md anywhere
+        run: |
+          found=$(find image-fs \( -iname '.env*' -o -iname 'PRD.md' \) 2>/dev/null)
+          if [ -n "$found" ]; then
+            echo "Forbidden file(s) found in the built image -- NOT pushed:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+          echo "Confirmed: no .env* or PRD.md anywhere in the image filesystem."
+
+      - name: Push image (content check passed)
+        run: docker push "${{ env.IMAGE }}:${{ github.sha }}"
+
+      - name: Trigger staging deploy via Render deploy hook
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_STAGING_DEPLOY_HOOK }}
+        run: |
+          imgurl="ghcr.io%2F444notdotun%2Fgiveaway-trust-engine%3A${{ github.sha }}"
+          curl -fsS -X POST "${DEPLOY_HOOK}&imgURL=${imgurl}"
