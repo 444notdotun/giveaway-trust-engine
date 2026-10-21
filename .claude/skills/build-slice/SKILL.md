@@ -1,6 +1,6 @@
 ---
 name: build-slice
-description: Build one slice of the giveaway engine through the full pipeline (plan, failing tests, implement, review, PR, explain gate).
+description: Build one slice of the giveaway engine through the full pipeline (plan, failing tests, implement, review, PR).
 disable-model-invocation: true
 ---
 Build slice $ARGUMENTS following this pipeline exactly. Do not skip or reorder steps.
@@ -13,4 +13,3 @@ Build slice $ARGUMENTS following this pipeline exactly. Do not skip or reorder s
 6. If the slice is marked CRITICAL REVIEW, or touches auth, webhooks, or the resolve endpoints, also use the security-reviewer subagent and fix its findings.
 7. OBSERVABILITY. Confirm giveawayId MDC, giveaway_logs events and metrics exist for the new paths, and that each failure test asserts them.
 8. Update the slice doc with decisions made and the failure modes covered. Commit with a descriptive message and open a pull request with `gh pr create`. Do not merge.
-9. EXPLAIN GATE. Ask Adedotun three questions about this slice's failure modes, one at a time, and wait for each answer. If an answer is vague, say so and ask again. Do not start another slice.

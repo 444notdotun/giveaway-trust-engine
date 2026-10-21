@@ -12,7 +12,6 @@ Stack: Java 25, Spring Boot 4.1.1, Maven wrapper (./mvnw), Postgres, Redis (noev
 * Use `/build-slice N` for every slice. One slice per branch and pull request. Do not start slice N+1 before slice N is merged.
 * Plan first and wait for approval. Failing tests first, shown red. Then implement.
 * Show test output as evidence. Never claim a slice is done without a passing `./mvnw -B verify`.
-* After each slice, run the explain gate: ask Adedotun three questions about its failure modes, one at a time, and wait for his answers in his own words. Reject vague answers ("looks good"). Do not open the next slice until he answers.
 * Do not add dependencies, change Java or Boot versions, or restructure packages without asking.
 * Never commit secrets. The repo is public. No defaults for secrets.
 
