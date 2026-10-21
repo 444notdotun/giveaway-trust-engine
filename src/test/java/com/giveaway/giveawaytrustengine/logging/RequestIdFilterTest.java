@@ -157,6 +157,10 @@ class RequestIdFilterTest {
         assertThat(secondRequestId.get())
                 .as("second request's requestId must not be the first request's value surviving the ThreadLocal")
                 .isNotEqualTo(firstRequestId.get());
+        assertThat(MDC.get("requestId"))
+                .as("finally block must clear the MDC after a normal (non-exception) request completes too, "
+                        + "not only on the exception path covered by the next test")
+                .isNull();
     }
 
     // Failure test 4 (Section 5.4): requestId is present in the MDC while an exception propagates

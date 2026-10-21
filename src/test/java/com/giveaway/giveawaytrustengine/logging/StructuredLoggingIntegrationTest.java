@@ -61,6 +61,27 @@ class StructuredLoggingIntegrationTest {
     }
 
     /**
+     * Same required app args as {@link #realAppArgs}, but WITHOUT the explicit
+     * {@code --logging.structured.format.console=ecs} override -- used to prove the application's
+     * own default (from {@code application.properties}, with no profile active) is what actually
+     * produces JSON, rather than relying on a test-supplied override to mask a regression where
+     * the default itself stopped being {@code ecs} (e.g. if it were accidentally moved into a
+     * profile-gated file instead of the base properties file).
+     */
+    private static String[] realAppArgsWithoutExplicitFormatOverride() {
+        return new String[] {
+                "--spring.autoconfigure.exclude=org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration,"
+                        + "org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration,"
+                        + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration",
+                "--app.environment=DEV",
+                "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
+                "--app.bachs.live-base-url=https://api.bachs.io",
+                "--app.bachs.base-url=https://sandbox-api.bachs.io",
+                "--server.port=0"
+        };
+    }
+
+    /**
      * Parses every line of captured stdout that is valid JSON, skipping anything that isn't
      * (plain non-JSON noise, blank lines, etc.) -- never a substring check.
      */
@@ -89,6 +110,29 @@ class StructuredLoggingIntegrationTest {
                     .as("expected at least one captured stdout line to parse as a JSON object "
                             + "under logging.structured.format.console=ecs, but captured output was:\n"
                             + output.getOut())
+                    .isNotEmpty();
+            assertThat(jsonLines).anySatisfy(node -> assertThat(node.has("message")).isTrue());
+        } finally {
+            context.close();
+        }
+    }
+
+    // Default profile (no profile active, no explicit override): application.properties' own
+    // logging.structured.format.console=ecs setting -- not a test-supplied override -- is what
+    // produces JSON. This is the regression this test exists to catch: slice 2b's follow-up added
+    // an application-local-dev.properties profile that blanks this property out for a readable
+    // local terminal, and it would be very easy for a future edit to accidentally move the ecs
+    // setting itself into that profile-gated file (or delete it from the base file) without any
+    // other test noticing, since every other test in this class passes the override explicitly.
+    @Test
+    void defaultProfileWithNoOverrideStillProducesJson(CapturedOutput output) {
+        ConfigurableApplicationContext context = realAppBuilder().run(realAppArgsWithoutExplicitFormatOverride());
+        try {
+            List<JsonNode> jsonLines = parseAllJsonLines(output);
+            assertThat(jsonLines)
+                    .as("expected JSON output from the DEFAULT profile (application.properties "
+                            + "alone, no --logging.structured.format.console override, no profile "
+                            + "active) but captured output was:\n" + output.getOut())
                     .isNotEmpty();
             assertThat(jsonLines).anySatisfy(node -> assertThat(node.has("message")).isTrue());
         } finally {
