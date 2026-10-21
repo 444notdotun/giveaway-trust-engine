@@ -88,9 +88,9 @@ jobs:
             exit 1
           fi
 
-          jar_path=$(find image-fs -iname '*.jar' | head -n1)
-          if [ -z "$jar_path" ]; then
-            echo "Could not locate the application jar inside the exported image" >&2
+          jar_path=image-fs/app/app.jar
+          if [ ! -f "$jar_path" ]; then
+            echo "Expected the application jar at $jar_path inside the exported image, but it does not exist" >&2
             exit 1
           fi
           jar_hits=$(unzip -l "$jar_path" | grep -iE '\.env[^/[:space:]]*($|[[:space:]])|PRD\.md($|[[:space:]])' || true)
@@ -121,6 +121,10 @@ jobs:
         env:
           STAGING_URL: ${{ vars.STAGING_URL }}
         run: |
+          if [ -z "$STAGING_URL" ]; then
+            echo "STAGING_URL repository variable is not set; cannot verify the deploy" >&2
+            exit 1
+          fi
           sha="${{ github.sha }}"
           deadline=$(( $(date +%s) + 600 ))
           commit=""
