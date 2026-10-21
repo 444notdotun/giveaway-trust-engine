@@ -7,7 +7,10 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Stale PR/branch runs get cancelled, but a run on main must never be
+  # cancelled mid-flight: it builds and pushes the image and triggers the
+  # staging deploy, and an interrupted push/deploy can leave things half done.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   verify:
@@ -39,3 +42,99 @@ jobs:
           name: surefire-reports
           path: target/surefire-reports/**
           if-no-files-found: ignore
+
+  image:
+    name: image
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/444notdotun/giveaway-trust-engine
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Validate COMMIT_SHA is exactly 40 lowercase hex characters
+        run: |
+          sha="${{ github.sha }}"
+          if ! echo "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "github.sha did not resolve to a 40-character lowercase hex SHA: '$sha'" >&2
+            exit 1
+          fi
+
+      - name: Build image locally -- NOT pushed yet, content check must pass first
+        run: docker build --build-arg COMMIT_SHA="${{ github.sha }}" -t "${{ env.IMAGE }}:${{ github.sha }}" .
+
+      - name: Export the local image's filesystem for the content check
+        run: |
+          container_id=$(docker create "${{ env.IMAGE }}:${{ github.sha }}")
+          docker export "$container_id" -o image.tar
+          docker rm "$container_id"
+          mkdir -p image-fs
+          tar -xf image.tar -C image-fs
+
+      - name: Fail if the image contains .env* or PRD.md anywhere, including inside the jar
+        run: |
+          found=$(find image-fs \( -iname '.env*' -o -iname 'PRD.md' \) 2>/dev/null)
+          if [ -n "$found" ]; then
+            echo "Forbidden file(s) found in the image filesystem -- NOT pushed:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+
+          jar_path=image-fs/app/app.jar
+          if [ ! -f "$jar_path" ]; then
+            echo "Expected the application jar at $jar_path inside the exported image, but it does not exist" >&2
+            exit 1
+          fi
+          jar_hits=$(unzip -l "$jar_path" | grep -iE '\.env[^/[:space:]]*($|[[:space:]])|PRD\.md($|[[:space:]])' || true)
+          if [ -n "$jar_hits" ]; then
+            echo "Forbidden entry/entries found inside $jar_path -- NOT pushed:" >&2
+            echo "$jar_hits" >&2
+            exit 1
+          fi
+
+          echo "Confirmed: no .env* or PRD.md in the image filesystem or inside the application jar."
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image (content check passed)
+        run: docker push "${{ env.IMAGE }}:${{ github.sha }}"
+
+      - name: Trigger staging deploy via Render deploy hook
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_STAGING_DEPLOY_HOOK }}
+        run: |
+          imgurl="ghcr.io%2F444notdotun%2Fgiveaway-trust-engine%3A${{ github.sha }}"
+          curl -fsS --connect-timeout 10 --max-time 30 -X POST "${DEPLOY_HOOK}&imgURL=${imgurl}"
+
+      - name: Verify staging is running the pushed commit
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+        run: |
+          if [ -z "$STAGING_URL" ]; then
+            echo "STAGING_URL repository variable is not set; cannot verify the deploy" >&2
+            exit 1
+          fi
+          sha="${{ github.sha }}"
+          deadline=$(( $(date +%s) + 600 ))
+          commit=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            commit=$(curl -fsS --max-time 10 "${STAGING_URL}/actuator/info" 2>/dev/null | jq -r '.app.commit // empty' 2>/dev/null || true)
+            if [ "$commit" = "$sha" ]; then
+              echo "Staging confirmed running commit $sha"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Staging did not report commit=$sha within 10 minutes (last seen: '${commit:-<none>}')" >&2
+          exit 1
