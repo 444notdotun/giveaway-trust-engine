@@ -43,7 +43,7 @@ public class StartupGuardBeanFactoryPostProcessor implements BeanFactoryPostProc
         }
         Environment env;
         try {
-            env = Environment.valueOf(envRaw.trim());
+            env = Environment.valueOf(envRaw);
         }
         catch (IllegalArgumentException ex) {
             throw fail("app.environment '" + envRaw + "' is not one of DEV, STAGING, or PRODUCTION");

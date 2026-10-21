@@ -564,6 +564,46 @@ class StartupGuardTest {
                 });
     }
 
+    // Case 8h: app.environment with leading whitespace ("DEV" with a leading space) is refused,
+    // naming app.environment -- no trim() happens before Environment.valueOf, so stray
+    // whitespace is a config error, not silently tolerated. Injected via the raw MapPropertySource
+    // helper since withPropertyValues trims "key=value" strings before the guard ever sees them.
+    @Test
+    void leadingWhitespaceEnvironmentValueRefuses(CapturedOutput output) {
+        guardedContextWithRawProperty("app.environment", " DEV")
+                .withPropertyValues(
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("app.environment");
+                    assertErrorLogLine(output, "app.environment");
+                    assertThat(output.getAll()).doesNotContain(FAKE_SANDBOX_URL).doesNotContain(FAKE_LIVE_URL);
+                });
+    }
+
+    // Case 8i: app.environment with trailing whitespace ("DEV" with a trailing space) is refused,
+    // naming app.environment -- same reasoning as the leading-whitespace case above.
+    @Test
+    void trailingWhitespaceEnvironmentValueRefuses(CapturedOutput output) {
+        guardedContextWithRawProperty("app.environment", "DEV ")
+                .withPropertyValues(
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("app.environment");
+                    assertErrorLogLine(output, "app.environment");
+                    assertThat(output.getAll()).doesNotContain(FAKE_SANDBOX_URL).doesNotContain(FAKE_LIVE_URL);
+                });
+    }
+
     // Real app wiring, bad combination: STAGING + the real live URL fails to start with
     // StartupGuardException as the ROOT CAUSE, with NO DataSource/Flyway/Redis autoconfiguration
     // excluded and no database available anywhere. This is the test that actually proves the
