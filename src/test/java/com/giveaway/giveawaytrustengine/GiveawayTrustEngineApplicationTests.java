@@ -39,6 +39,10 @@ class GiveawayTrustEngineApplicationTests {
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+        registry.add("app.environment", () -> "DEV");
+        registry.add("app.bachs.sandbox-base-url", () -> "https://sandbox-api.bachs.io");
+        registry.add("app.bachs.live-base-url", () -> "https://api.bachs.io");
+        registry.add("app.bachs.base-url", () -> "https://sandbox-api.bachs.io");
     }
 
     @Test
