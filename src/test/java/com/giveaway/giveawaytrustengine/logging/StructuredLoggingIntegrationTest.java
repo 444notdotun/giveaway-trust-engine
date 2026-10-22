@@ -54,6 +54,7 @@ class StructuredLoggingIntegrationTest {
                 "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                 "--app.bachs.live-base-url=https://api.bachs.io",
                 "--app.bachs.base-url=https://sandbox-api.bachs.io",
+                "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
                 "--server.port=0",
                 "--logging.structured.format.console=ecs"));
         args.addAll(List.of(extra));
@@ -77,6 +78,7 @@ class StructuredLoggingIntegrationTest {
                 "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                 "--app.bachs.live-base-url=https://api.bachs.io",
                 "--app.bachs.base-url=https://sandbox-api.bachs.io",
+                "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
                 "--server.port=0"
         };
     }

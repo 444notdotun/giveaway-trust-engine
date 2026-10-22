@@ -624,7 +624,11 @@ class StartupGuardTest {
                     "--app.environment=STAGING",
                     "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                     "--app.bachs.live-base-url=https://api.bachs.io",
-                    "--app.bachs.base-url=https://api.bachs.io");
+                    "--app.bachs.base-url=https://api.bachs.io",
+                    // Slice 3's JwtSigningKeyGuardBeanFactoryPostProcessor now also runs on every
+                    // real app boot -- a valid key here keeps this test failing for the Bachs
+                    // mismatch it actually means to test, not for an unrelated missing-key reason.
+                    "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
             context.close();
             fail("expected the real application to fail to start for STAGING + live base-url");
         } catch (Exception startupFailure) {
@@ -654,7 +658,8 @@ class StartupGuardTest {
                 "--app.environment=DEV",
                 "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                 "--app.bachs.live-base-url=https://api.bachs.io",
-                "--app.bachs.base-url=https://sandbox-api.bachs.io");
+                "--app.bachs.base-url=https://sandbox-api.bachs.io",
+                "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
         try {
             assertThat(context.isActive()).isTrue();
         } finally {

@@ -42,9 +42,12 @@ import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -104,7 +107,7 @@ class OAuthLoginFlowTest {
                         "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                         "--app.bachs.live-base-url=https://api.bachs.io",
                         "--app.bachs.base-url=https://sandbox-api.bachs.io",
-                        "--app.jwt.signing-key=01234567890123456789012345678901",
+                        "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
                         "--app.x-oauth.client-id=test-client-id",
                         "--app.x-oauth.client-secret=test-client-secret",
                         "--app.x-oauth.redirect-uri=http://localhost/auth/callback",
@@ -346,8 +349,16 @@ class OAuthLoginFlowTest {
         int before = countAllCommunityManagers();
         HttpResponse<String> response = callback("code=" + code + "&state=" + state);
 
+        // FIRST: the app must have actually attempted the token exchange at all -- this is the
+        // assertion that fails against the current 501-returning stub, which never calls out to
+        // X in the first place, so there is nothing real for the rest of this test to prove yet.
+        wireMock.verify(postRequestedFor(urlPathEqualTo("/2/oauth2/token")));
+
+        // THEN: a clean 4xx/5xx-but-not-crashed response shape, not an unhandled exception.
         assertThat(response.statusCode()).isNotEqualTo(500);
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(600);
+
+        // AND: no half-created row.
         assertThat(countAllCommunityManagers())
                 .as("no half-created row from a token-exchange timeout")
                 .isEqualTo(before);
@@ -366,6 +377,11 @@ class OAuthLoginFlowTest {
 
         int before = countAllCommunityManagers();
         HttpResponse<String> response = callback("code=" + code + "&state=" + state);
+
+        // FIRST: the app must have actually attempted the user lookup (which requires the token
+        // exchange to have already succeeded first) -- fails against the current 501-returning
+        // stub, which never calls out to X at all.
+        wireMock.verify(getRequestedFor(urlPathEqualTo("/2/users/me")));
 
         assertThat(response.statusCode()).isNotEqualTo(500);
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(600);
@@ -577,5 +593,271 @@ class OAuthLoginFlowTest {
         assertThat(anyRefreshCookie).as("a refresh-token cookie must be set").isTrue();
 
         assertThat(countCommunityManagersByXUserId(xUserId)).isEqualTo(1);
+    }
+
+    // Failure test 8 (Section 5.8), isolated: cookie flags are asserted directly against a real
+    // response, not assumed from code review. Deliberately does NOT depend on the PKCE
+    // code_challenge assertions in the happy-path test above -- this test's only job is to prove
+    // the Set-Cookie headers are both present (first, must fail against the current 501-returning
+    // stub, which sets no cookies at all) and correctly flagged (HttpOnly, Secure,
+    // SameSite=Strict, Path, Max-Age), for BOTH the access and refresh cookies.
+    @Test
+    void cookieFlagsAssertedDirectly() throws Exception {
+        String xUserId = "x-user-" + UUID.randomUUID();
+        HttpResponse<Void> loginResponse = startLogin();
+        String location = loginResponse.headers().firstValue("Location").orElseThrow();
+        String state = queryParam(location, "state");
+
+        String code = "code-" + UUID.randomUUID();
+        String accessToken = "access-" + UUID.randomUUID();
+        stubTokenExchangeSuccess(code, accessToken);
+        stubUserLookupSuccess(accessToken, xUserId, "cookie_flag_handle");
+
+        HttpResponse<String> response = callback("code=" + code + "&state=" + state);
+
+        // FIRST: the cookies must actually exist at all. This is the assertion that fails
+        // meaningfully against the current stub (which returns 501 with no Set-Cookie headers) --
+        // everything below this line only runs once this passes for real.
+        List<String> setCookies = response.headers().allValues("Set-Cookie");
+        assertThat(setCookies)
+                .as("both an access-token and a refresh-token Set-Cookie header must be present")
+                .hasSizeGreaterThanOrEqualTo(2);
+
+        String accessCookie = setCookies.stream()
+                .filter(c -> c.toLowerCase().startsWith("accesstoken="))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no accessToken Set-Cookie header found"));
+        String refreshCookie = setCookies.stream()
+                .filter(c -> c.toLowerCase().startsWith("refreshtoken="))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no refreshToken Set-Cookie header found"));
+
+        // THEN: flags on each cookie individually.
+        for (String cookie : List.of(accessCookie, refreshCookie)) {
+            assertThat(cookie).contains("HttpOnly");
+            assertThat(cookie).contains("Secure");
+            assertThat(cookie).contains("SameSite=Strict");
+            assertThat(cookie).contains("Path=/");
+            assertThat(cookie).contains("Max-Age=");
+        }
+
+        // Access cookie Max-Age matches the 15-minute access-token lifetime; refresh cookie
+        // Max-Age matches the 7-day refresh-token lifetime (Section 3).
+        assertThat(maxAgeOf(accessCookie)).isEqualTo(Duration.ofMinutes(15).toSeconds());
+        assertThat(maxAgeOf(refreshCookie)).isEqualTo(Duration.ofDays(7).toSeconds());
+    }
+
+    private static long maxAgeOf(String setCookieHeader) {
+        for (String part : setCookieHeader.split(";")) {
+            String trimmed = part.trim();
+            if (trimmed.toLowerCase().startsWith("max-age=")) {
+                return Long.parseLong(trimmed.substring("max-age=".length()));
+            }
+        }
+        throw new AssertionError("no Max-Age attribute found in: " + setCookieHeader);
+    }
+
+    /** Raw Redis TTL (seconds), via the same Lettuce pattern used elsewhere in this file. */
+    private Long ttlOf(String key) {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(REDIS.getHost(), REDIS.getMappedPort(6379));
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, LettuceClientConfiguration.builder()
+                .commandTimeout(Duration.ofSeconds(2)).build());
+        factory.afterPropertiesSet();
+        try {
+            return factory.getConnection().keyCommands().ttl(key.getBytes());
+        } finally {
+            factory.destroy();
+        }
+    }
+
+    /**
+     * Sends a raw HTTP/1.1 GET /auth/login over a plain socket with a forged Host header, since
+     * java.net.http.HttpClient refuses to let a caller set the restricted "Host" header at all.
+     * Returns the Location header's value.
+     */
+    private String sendRawRequestWithForgedHost(String forgedHost) throws Exception {
+        try (java.net.Socket socket = new java.net.Socket("localhost", appPort)) {
+            socket.setSoTimeout(5000);
+            String request = "GET /auth/login HTTP/1.1\r\n"
+                    + "Host: " + forgedHost + "\r\n"
+                    + "Connection: close\r\n"
+                    + "\r\n";
+            socket.getOutputStream().write(request.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+
+            StringBuilder responseText = new StringBuilder();
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(socket.getInputStream(), java.nio.charset.StandardCharsets.US_ASCII))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    responseText.append(line).append('\n');
+                }
+            }
+            for (String line : responseText.toString().split("\n")) {
+                if (line.toLowerCase().startsWith("location:")) {
+                    return line.substring(line.indexOf(':') + 1).trim();
+                }
+            }
+            throw new AssertionError("no Location header found in raw response:\n" + responseText);
+        }
+    }
+
+    // New RED test (a) -- plan doc Section 0: "The redirect URI sent to X comes from config
+    // (app.x-oauth.redirect-uri, bound from X_OAUTH_REDIRECT_URI), never built from the inbound
+    // request's Host header." Two /auth/login calls, one with a forged Host header, must
+    // produce byte-identical redirect_uri values, equal to the configured value -- never built
+    // from the forged header. FAILS TODAY: the stub never includes a redirect_uri param at all.
+    @Test
+    void loginRedirectUriAlwaysComesFromConfigNeverFromHostHeader() throws Exception {
+        HttpRequest normalRequest = HttpRequest.newBuilder()
+                .uri(URI.create(baseUri() + "/auth/login"))
+                .GET()
+                .build();
+        HttpResponse<Void> normalResponse = HTTP.send(normalRequest, HttpResponse.BodyHandlers.discarding());
+        String normalLocation = normalResponse.headers().firstValue("Location").orElseThrow();
+
+        // java.net.http.HttpClient refuses to let callers set the restricted "Host" header
+        // directly (it's managed by the client itself), so a forged Host header has to be sent
+        // over a raw socket instead -- this is still a real HTTP/1.1 request hitting the real,
+        // running application, not a mock.
+        String forgedLocation = sendRawRequestWithForgedHost("evil.example.com");
+
+        String normalRedirectUri = queryParam(normalLocation, "redirect_uri");
+        String forgedRedirectUri = queryParam(forgedLocation, "redirect_uri");
+
+        assertThat(normalRedirectUri)
+                .as("redirect_uri must be present and must equal the configured app.x-oauth.redirect-uri value")
+                .isEqualTo("http://localhost/auth/callback");
+        assertThat(forgedRedirectUri)
+                .as("redirect_uri must be present and must equal the configured value even with a forged Host header")
+                .isEqualTo("http://localhost/auth/callback");
+        assertThat(forgedRedirectUri)
+                .as("redirect_uri must never be built from the forged Host header")
+                .doesNotContain("evil.example.com");
+        assertThat(normalRedirectUri)
+                .as("redirect_uri must be byte-identical regardless of the inbound Host header")
+                .isEqualTo(forgedRedirectUri);
+    }
+
+    // New RED test (b) -- plan doc Section 0: the redirect to X's authorize endpoint must carry
+    // response_type=code, the configured client_id, scope "users.read tweet.read",
+    // code_challenge_method=S256, a state, and a code_challenge. Each asserted independently so a
+    // future failure names exactly which one broke. FAILS TODAY: only "state" exists in the
+    // stub's redirect; the other five are entirely absent.
+    @Test
+    void loginRedirectCarriesAllRequiredAuthorizeParameters() throws Exception {
+        HttpResponse<Void> loginResponse = startLogin();
+        String location = loginResponse.headers().firstValue("Location").orElseThrow();
+
+        assertThat(queryParam(location, "response_type"))
+                .as("response_type must be exactly 'code'")
+                .isEqualTo("code");
+        assertThat(queryParam(location, "client_id"))
+                .as("client_id must equal the configured app.x-oauth.client-id value")
+                .isEqualTo("test-client-id");
+        assertThat(queryParam(location, "scope"))
+                .as("scope must be exactly 'users.read tweet.read' (Section 0)")
+                .isEqualTo("users.read tweet.read");
+        assertThat(queryParam(location, "code_challenge_method"))
+                .as("code_challenge_method must be exactly 'S256'")
+                .isEqualTo("S256");
+        assertThat(queryParam(location, "state"))
+                .as("state must be present")
+                .isNotNull();
+        assertThat(queryParam(location, "code_challenge"))
+                .as("code_challenge must be present")
+                .isNotNull();
+    }
+
+    // New RED test (c) -- plan doc Section 0: the PKCE code_verifier never appears in the URL,
+    // the HTTP response, or any captured log line; it is instead stored server-side in Redis
+    // under oauth:state:{state}. FAILS TODAY: the stub never writes anything to Redis at all, so
+    // no value is ever stored under this key.
+    @Test
+    void pkceVerifierNeverLeaksAndIsStoredInRedis(CapturedOutput output) throws Exception {
+        HttpResponse<Void> loginResponse = startLogin();
+        String location = loginResponse.headers().firstValue("Location").orElseThrow();
+        String state = queryParam(location, "state");
+        assertThat(state).as("a state value must be present in the redirect").isNotNull();
+
+        String storedVerifier = readStoredVerifier(state);
+        assertThat(storedVerifier)
+                .as("a PKCE code_verifier must be stored server-side in Redis under oauth:state:{state}")
+                .isNotNull();
+        assertThat(storedVerifier.length())
+                .as("the stored verifier must be a plausible PKCE verifier length (RFC 7636: 43-128 chars)")
+                .isGreaterThanOrEqualTo(43);
+
+        assertThat(location)
+                .as("the PKCE verifier must never appear in the Location header itself")
+                .doesNotContain(storedVerifier);
+        assertThat(output.getAll())
+                .as("the PKCE verifier must never appear in any captured log line")
+                .doesNotContain(storedVerifier);
+    }
+
+    // New RED test (d) -- plan doc Section 0 / CLAUDE.md: state must carry at least 128 bits of
+    // entropy and be unique across many calls. A bare UUID.randomUUID() (today's stub) carries
+    // only 122 bits of entropy per RFC 4122 (6 fixed version/variant bits out of 128 total), which
+    // is strictly LESS than 128 -- this test isolates that entropy shortfall as the failure, not
+    // uniqueness (which a random UUID would actually satisfy).
+    @Test
+    void stateHasAtLeast128BitsOfEntropyAndIsUniqueAcross1000Calls() throws Exception {
+        java.util.Set<String> states = new java.util.HashSet<>();
+        for (int i = 0; i < 1000; i++) {
+            HttpResponse<Void> response = startLogin();
+            String location = response.headers().firstValue("Location").orElseThrow();
+            String state = queryParam(location, "state");
+            assertThat(state).isNotNull();
+            states.add(state);
+        }
+
+        assertThat(states)
+                .as("all 1000 state values must be distinct")
+                .hasSize(1000);
+
+        for (String state : states) {
+            // Hex-encoded: 1 char = 4 bits, so >128 bits requires > 32 chars (strictly more than
+            // 122 bits' worth, which bare UUID.toString() -- 36 chars incl. 4 dashes, 32 hex
+            // digits -- fails). Base64url: 1 char ~= 6 bits, so >128 bits requires > 22 chars.
+            // Either way, require strictly more than ceil(122/4)=31 hex-equivalent chars' worth;
+            // concretely: more than 32 raw hex characters once dashes are stripped, which a plain
+            // UUID (exactly 32 hex chars = 128 "nominal" bits but only 122 actual entropy bits,
+            // since 6 bits are fixed version/variant) must fail.
+            String hexOnly = state.replace("-", "");
+            boolean looksHex = hexOnly.chars().allMatch(c -> Character.digit(c, 16) >= 0);
+            if (looksHex) {
+                assertThat(hexOnly.length())
+                        .as("hex-encoded state must be at least 33 chars (>128 bits actual entropy, "
+                                + "strictly more than a bare UUID's 122 bits) for state=" + state)
+                        .isGreaterThan(32);
+            } else {
+                assertThat(state.length())
+                        .as("base64url-encoded state must be at least 23 chars (>128 bits) for state=" + state)
+                        .isGreaterThan(22);
+            }
+        }
+    }
+
+    // New RED test (e) -- plan doc Section 0 / Section 4: oauth:state:{state} must have a TTL,
+    // greater than 0 and no more than the configured 10-minute ceiling. FAILS TODAY: nothing is
+    // ever written to Redis by the stub, so there is no key to check a TTL on at all (ttl()
+    // returns a sentinel "key does not exist" value, not a real positive TTL).
+    @Test
+    void oauthStateKeyHasATtlWithinTheTenMinuteCeiling() throws Exception {
+        HttpResponse<Void> loginResponse = startLogin();
+        String location = loginResponse.headers().firstValue("Location").orElseThrow();
+        String state = queryParam(location, "state");
+        assertThat(state).isNotNull();
+
+        Long ttlSeconds = ttlOf("oauth:state:" + state);
+
+        assertThat(ttlSeconds)
+                .as("oauth:state:{state} must exist with a real TTL (a Lettuce ttl() of -2 means "
+                        + "the key does not exist at all, -1 means it exists with no expiry -- "
+                        + "either is a failure here)")
+                .isNotNull()
+                .isGreaterThan(0L)
+                .isLessThanOrEqualTo(Duration.ofMinutes(10).toSeconds());
     }
 }

@@ -317,4 +317,77 @@ class RefreshTokenConcurrencyTest {
         RefreshResult second = service.refresh(result.newRefreshCookieValue());
         assertThat(second.familyId()).isEqualTo(familyId);
     }
+
+    // Refresh tokens must be stored hashed -- the raw secret must never appear as the literal
+    // stored bytes in refresh_token.token_hash.
+    @Test
+    void refreshTokensAreStoredHashedNeverRawInTokenHashColumn() throws Exception {
+        UUID familyId = UUID.randomUUID();
+
+        RevocationChecker revocationChecker = new RevocationChecker(null, CLOCK, Duration.ofMinutes(15));
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+
+        // RED: issueInitialRefreshToken always throws UnsupportedOperationException today -- this
+        // fails here, before the hash assertion below is ever reached, same as every other
+        // not-implemented refresh() call in this class.
+        RefreshResult result = service.issueInitialRefreshToken(cmId, familyId);
+
+        assertThat(result).isNotNull();
+        String rawCookieValue = result.newRefreshCookieValue();
+        String rawSecretHalf = rawCookieValue.substring(rawCookieValue.indexOf('.') + 1);
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT token_hash FROM refresh_token WHERE family_id = ?")) {
+            ps.setObject(1, familyId);
+            var rs = ps.executeQuery();
+            assertThat(rs.next()).as("a refresh_token row must have been inserted").isTrue();
+            byte[] storedHash = rs.getBytes("token_hash");
+            assertThat(storedHash)
+                    .as("the raw secret must never be stored literally as token_hash")
+                    .isNotEqualTo(rawSecretHalf.getBytes());
+        }
+    }
+
+    // Failure test 3 variant (Section 5, expired refresh token): a refresh token whose
+    // expires_at is in the past (relative to the injected Clock) must be rejected specifically
+    // with ExpiredRefreshTokenException, not just "any exception".
+    @Test
+    void expiredRefreshTokenIsRejectedWithSpecificException() throws Exception {
+        UUID familyId = UUID.randomUUID();
+        UUID tokenId = UUID.randomUUID();
+        String cookieValue = insertExpiredToken(tokenId, familyId);
+
+        RevocationChecker revocationChecker = new RevocationChecker(null, CLOCK, Duration.ofMinutes(15));
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+
+        org.junit.jupiter.api.Assertions.assertThrows(ExpiredRefreshTokenException.class,
+                () -> service.refresh(cookieValue));
+    }
+
+    /** Inserts a refresh_token row whose expires_at is already in the past relative to CLOCK. */
+    private String insertExpiredToken(UUID tokenId, UUID familyId) throws SQLException {
+        byte[] secret = new byte[32];
+        new SecureRandom().nextBytes(secret);
+        byte[] hash;
+        try {
+            hash = MessageDigest.getInstance("SHA-256").digest(secret);
+        } catch (Exception impossible) {
+            throw new IllegalStateException(impossible);
+        }
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
+                             + "VALUES (?,?,?,?,?,?)")) {
+            ps.setObject(1, tokenId);
+            ps.setObject(2, familyId);
+            ps.setObject(3, cmId);
+            ps.setBoolean(4, false);
+            ps.setTimestamp(5, Timestamp.from(FIXED_NOW.minus(Duration.ofDays(1)))); // already expired
+            ps.setBytes(6, hash);
+            ps.executeUpdate();
+        }
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(tokenId.toString().getBytes())
+                + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+    }
 }

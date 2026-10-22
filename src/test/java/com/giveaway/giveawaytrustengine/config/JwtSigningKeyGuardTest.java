@@ -7,6 +7,8 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 
+import java.util.Base64;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -15,8 +17,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * minimum length enforced at startup") and "Tests summary" (the guard's own startup-refusal
  * tests, same CapturedOutput pattern as {@link StartupGuardTest}).
  *
- * RED: {@code JwtSigningKeyGuardBeanFactoryPostProcessor} does not exist yet -- this is expected
- * to fail to compile until slice 3's GREEN step adds it.
+ * {@code app.jwt.signing-key} is interpreted as BASE64, decoded to raw bytes, and the 32-byte
+ * minimum is enforced on the DECODED byte length, never on the configured string's own length
+ * -- the real key is {@code openssl rand -base64 48} output (64 base64 characters encoding 48
+ * raw bytes). Every non-missing test value below is therefore itself base64-encoded.
  *
  * Mirrors {@link StartupGuardTest}'s own doc comment about never asserting only an in-memory
  * return value: every case here asserts the real startup failure (root cause type + message)
@@ -26,12 +30,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 class JwtSigningKeyGuardTest {
 
     private static final String GUARD_LOGGER = "JwtSigningKeyGuardBeanFactoryPostProcessor";
-    // 32 bytes exactly -- the minimum this guard is specified to accept.
-    private static final String VALID_32_BYTE_KEY = "01234567890123456789012345678901".substring(0, 32);
 
     private static ApplicationContextRunner guardedContext() {
         return new ApplicationContextRunner()
                 .withBean(JwtSigningKeyGuardBeanFactoryPostProcessor.class);
+    }
+
+    private static String base64Of(int byteLength) {
+        byte[] bytes = new byte[byteLength];
+        for (int i = 0; i < byteLength; i++) {
+            bytes[i] = (byte) i;
+        }
+        return Base64.getEncoder().encodeToString(bytes);
     }
 
     private static Throwable rootCause(AssertableApplicationContext context) {
@@ -53,7 +63,8 @@ class JwtSigningKeyGuardTest {
                 .isTrue();
     }
 
-    // Case 1: app.jwt.signing-key missing entirely -- refuses to start.
+    // Case 1: app.jwt.signing-key missing entirely -- refuses to start. Unaffected by the base64
+    // decode rule -- there is no value to decode.
     @Test
     void missingSigningKeyRefusesToStart(CapturedOutput output) {
         guardedContext()
@@ -68,10 +79,10 @@ class JwtSigningKeyGuardTest {
                 });
     }
 
-    // Case 2: app.jwt.signing-key present but shorter than 32 bytes (UTF-8 decoded) -- refuses.
+    // Case 2: app.jwt.signing-key present, valid base64, but decodes to well under 32 bytes.
     @Test
     void tooShortSigningKeyRefusesToStart(CapturedOutput output) {
-        String tooShort = "short-key-only-16b"; // 18 bytes, well under 32
+        String tooShort = base64Of(18); // decodes to 18 bytes, well under 32
         guardedContext()
                 .withPropertyValues("app.jwt.signing-key=" + tooShort)
                 .run(context -> {
@@ -85,21 +96,75 @@ class JwtSigningKeyGuardTest {
                 });
     }
 
-    // Happy path: a signing key of exactly 32 UTF-8 bytes starts successfully.
+    // Exact boundary, refused side: a base64 string that decodes to exactly 31 bytes is refused.
     @Test
-    void exactly32ByteSigningKeyStarts(CapturedOutput output) {
+    void base64DecodingToExactly31BytesRefusesToStart(CapturedOutput output) {
+        String decodes31Bytes = base64Of(31);
         guardedContext()
-                .withPropertyValues("app.jwt.signing-key=" + VALID_32_BYTE_KEY)
+                .withPropertyValues("app.jwt.signing-key=" + decodes31Bytes)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root.getMessage()).containsIgnoringCase("app.jwt.signing-key");
+                    assertErrorLogLine(output);
+                    assertThat(output.getAll())
+                            .as("the signing key value itself must never appear in logs, even when rejected")
+                            .doesNotContain(decodes31Bytes);
+                });
+    }
+
+    // Exact boundary, accepted side: a base64 string that decodes to exactly 32 bytes starts
+    // successfully.
+    @Test
+    void base64DecodingToExactly32BytesStarts(CapturedOutput output) {
+        String decodes32Bytes = base64Of(32);
+        guardedContext()
+                .withPropertyValues("app.jwt.signing-key=" + decodes32Bytes)
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(output.getAll())
                             .as("the signing key value itself must never appear in logs, even on success")
-                            .doesNotContain(VALID_32_BYTE_KEY);
+                            .doesNotContain(decodes32Bytes);
+                });
+    }
+
+    // A configured value that isn't valid base64 at all must be refused outright, naming
+    // app.jwt.signing-key -- never silently reinterpreted as raw UTF-8 bytes.
+    @Test
+    void nonBase64SigningKeyRefusesToStartWithoutFallingBackToRawUtf8(CapturedOutput output) {
+        String notBase64 = "@@@@this-is-not-valid-base64@@@@";
+        guardedContext()
+                .withPropertyValues("app.jwt.signing-key=" + notBase64)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root.getMessage()).containsIgnoringCase("app.jwt.signing-key");
+                    assertErrorLogLine(output);
+                    assertThat(output.getAll())
+                            .as("the signing key value itself must never appear in logs, even when rejected")
+                            .doesNotContain(notBase64);
+                });
+    }
+
+    // Happy path: a signing key that base64-decodes to exactly 32 bytes starts successfully
+    // (same case as base64DecodingToExactly32BytesStarts, kept under its original name too since
+    // it was the pre-existing happy-path test).
+    @Test
+    void exactly32ByteDecodedSigningKeyStarts(CapturedOutput output) {
+        String valid = base64Of(32);
+        guardedContext()
+                .withPropertyValues("app.jwt.signing-key=" + valid)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(output.getAll())
+                            .as("the signing key value itself must never appear in logs, even on success")
+                            .doesNotContain(valid);
                 });
     }
 
     // Blank (whitespace-only) signing key must be treated as missing, not as a too-short value
     // that happens to pass some other check -- same whitespace discipline as StartupGuardTest.
+    // Unaffected by the base64 decode rule -- isUnset() short-circuits before any decode attempt.
     @Test
     void whitespaceOnlySigningKeyRefusesToStart(CapturedOutput output) {
         guardedContext()

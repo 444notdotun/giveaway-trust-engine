@@ -57,9 +57,16 @@ class RevocationCheckerTest {
         certDir = Files.createTempDirectory("revocation-checker-tls");
         generateSelfSignedCertWithRedisHelper(certDir);
 
+        // Copying the whole directory (withCopyFileToContainer(MountableFile.forHostPath(certDir), ...))
+        // preserves the host's file permissions -- openssl writes key files with a restrictive
+        // umask (often 600, owned by the host UID), which the container's redis user then can't
+        // read. Copying each file individually with an explicit, permissive mode sidesteps that;
+        // these are throwaway test-only certs, so world-readable is not a real exposure.
         TLS_REDIS = new GenericContainer<>(DockerImageName.parse(TestImages.REDIS))
                 .withExposedPorts(6380)
-                .withCopyFileToContainer(MountableFile.forHostPath(certDir), "/tls")
+                .withCopyFileToContainer(MountableFile.forHostPath(certDir.resolve("ca.crt"), 0644), "/tls/ca.crt")
+                .withCopyFileToContainer(MountableFile.forHostPath(certDir.resolve("redis.crt"), 0644), "/tls/redis.crt")
+                .withCopyFileToContainer(MountableFile.forHostPath(certDir.resolve("redis.key"), 0644), "/tls/redis.key")
                 .withCommand("redis-server",
                         "--tls-port", "6380",
                         "--port", "0",
@@ -116,7 +123,7 @@ class RevocationCheckerTest {
                 TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
         config.setPassword(password);
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
-                .useSsl().disablePeerVerification()
+                .useSsl().disablePeerVerification().and()
                 .commandTimeout(Duration.ofSeconds(2))
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
@@ -125,15 +132,42 @@ class RevocationCheckerTest {
     }
 
     // Failure test 10 (Section 5.10): a connection over TLS with the correct password succeeds
-    // end to end -- a real revocation-check read completes successfully.
+    // end to end.
+    //
+    // Deliberate exception to "nothing should pass right now": this test bypasses
+    // RevocationChecker entirely (whose own isFamilyRevoked/revokeFamily methods are still RED
+    // stubs that never touch Redis at all -- calling through them here would pass vacuously no
+    // matter what the infrastructure actually does, which was the bug in the original version of
+    // this test). Instead it performs a real SET then GET round-trip directly against the
+    // TLS+auth Testcontainers Redis via a raw LettuceConnectionFactory, proving the TLS cert +
+    // requirepass infrastructure itself genuinely works, independent of RevocationChecker's own
+    // still-stubbed business logic. This is EXPECTED to legitimately pass.
     @Test
-    void tlsConnectionWithCorrectPasswordSucceeds() {
-        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD);
-        UUID familyId = UUID.randomUUID();
+    void infrastructureTest_tlsConnectionWithCorrectPasswordSucceeds() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
+                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
+        config.setPassword(REDIS_PASSWORD);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .useSsl().disablePeerVerification().and()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
 
-        boolean revoked = checker.isFamilyRevoked(familyId, FIXED_NOW.minusSeconds(60));
+        String key = "tls-roundtrip-" + UUID.randomUUID();
+        String value = "value-" + UUID.randomUUID();
+        try {
+            factory.getConnection().stringCommands().set(key.getBytes(), value.getBytes());
+            byte[] readBack = factory.getConnection().stringCommands().get(key.getBytes());
 
-        assertThat(revoked).as("a family never revoked must read back as not revoked").isFalse();
+            assertThat(readBack).isNotNull();
+            assertThat(new String(readBack))
+                    .as("a real SET then GET over TLS with the correct password must round-trip "
+                            + "the exact value written")
+                    .isEqualTo(value);
+        } finally {
+            factory.destroy();
+        }
     }
 
     // Failure test 11 (Section 5.11): a wrong password fails fast (within the configured
@@ -174,10 +208,13 @@ class RevocationCheckerTest {
     }
 
     // Failure test 12 (Section 5.12): neither the Redis password nor the full connection string
-    // ever appears in any captured log line, on BOTH the successful-TLS-connection path and the
-    // wrong-password failure path.
+    // ever appears in any captured log line, OR in the thrown exception's own message/cause
+    // chain, on BOTH the successful-TLS-connection path and the wrong-password failure path.
+    // Driven through RevocationChecker.isFamilyRevoked itself (never a raw Lettuce call), since
+    // that's the real call site a caller actually uses -- a leak in the exception message this
+    // method throws would be just as real a leak as one in a log line.
     @Test
-    void redisPasswordAndConnectionStringNeverAppearInLogsOnSuccessOrFailure(CapturedOutput output) {
+    void redisPasswordAndConnectionStringNeverAppearInLogsOrExceptionOnSuccessOrFailure(CapturedOutput output) {
         String fullConnectionStringShape = "rediss://default:" + REDIS_PASSWORD + "@"
                 + TLS_REDIS.getHost() + ":" + TLS_REDIS.getMappedPort(6380);
 
@@ -185,11 +222,37 @@ class RevocationCheckerTest {
         successChecker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60));
 
         RevocationChecker failureChecker = checkerWithPassword("definitely-the-wrong-password");
-        try {
-            failureChecker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60));
-        } catch (RevocationCheckUnavailableException expected) {
-            // expected on this path
+
+        // The wrong-password call must actually fail (not silently return a yes/no answer) --
+        // this is the assertion that fails against the current do-nothing stub, which never
+        // touches Redis at all and so never throws anything here.
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> failureChecker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)));
+        assertThat(thrown)
+                .as("a wrong password must fail the check, not silently return an answer")
+                .isInstanceOf(RevocationCheckUnavailableException.class);
+
+        // Walk the full cause chain -- a leaked secret could just as easily be wrapped three
+        // levels down (e.g. Lettuce's own RedisCommandExecutionException naming the credential)
+        // as sitting directly in the outermost message.
+        Throwable cursor = thrown;
+        while (cursor != null) {
+            assertThat(cursor.getMessage())
+                    .as("exception message at this level of the cause chain (%s) must never "
+                            + "contain the real password", cursor.getClass().getName())
+                    .doesNotContain(REDIS_PASSWORD)
+                    .doesNotContain(fullConnectionStringShape);
+            cursor = cursor.getCause();
         }
+
+        // FIRST (of the log assertions): there must actually be SOME captured output to check at
+        // all -- zero log lines would make "output doesn't contain the secret" trivially true
+        // for the wrong reason, proving nothing about real logging discipline.
+        assertThat(output.getAll())
+                .as("the success and failure paths above must have produced at least one log line "
+                        + "for this test to meaningfully prove the password/connection string are "
+                        + "absent from it")
+                .isNotBlank();
 
         assertThat(output.getAll())
                 .as("the real password must never appear in captured output on either path")
@@ -242,7 +305,7 @@ class RevocationCheckerTest {
                 TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
         config.setPassword(REDIS_PASSWORD);
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
-                .useSsl().disablePeerVerification()
+                .useSsl().disablePeerVerification().and()
                 .commandTimeout(Duration.ofSeconds(2))
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);

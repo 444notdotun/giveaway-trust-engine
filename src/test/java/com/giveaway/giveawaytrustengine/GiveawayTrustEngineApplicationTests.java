@@ -43,6 +43,7 @@ class GiveawayTrustEngineApplicationTests {
         registry.add("app.bachs.sandbox-base-url", () -> "https://sandbox-api.bachs.io");
         registry.add("app.bachs.live-base-url", () -> "https://api.bachs.io");
         registry.add("app.bachs.base-url", () -> "https://sandbox-api.bachs.io");
+        registry.add("app.jwt.signing-key", () -> "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
     }
 
     @Test
