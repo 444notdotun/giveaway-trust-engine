@@ -43,13 +43,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * the database OR Redis at all), so every assertion below that depends on either store actually
  * changing state is expected to fail.
  *
- * Note on test 3 (DB failure leaves Redis untouched): {@code RevocationChecker}'s constructor
- * today is {@code (LettuceConnectionFactory, Clock, Duration)} -- it has no DataSource parameter
- * at all yet, since {@code revokeFamily} doesn't touch the database in this RED stub. Once a real
- * implementation adds DB access to {@code revokeFamily} (per Section 4), this test should be
- * revisited to actually inject a broken DataSource per the plan doc's letter; for now it exercises
- * the only DB-interaction surface that actually exists today -- none -- which itself proves the
- * gap this slice is tracking.
+ * {@code RevocationChecker} now takes a {@code DataSource} ({@code revokeFamily} marks every
+ * {@code refresh_token} row in the family {@code used = true} before touching Redis -- Section
+ * 4) -- test 3 injects a genuinely broken {@code DataSource} (every {@code getConnection()}
+ * throws) to prove the reverse ordering never happens, per the plan doc's letter.
  */
 @Testcontainers
 class RevocationOrderingTest {
@@ -111,6 +108,101 @@ class RevocationOrderingTest {
         }
     }
 
+    private static javax.sql.DataSource workingDataSource() {
+        return new javax.sql.DataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                return connect();
+            }
+
+            @Override
+            public Connection getConnection(String username, String password) throws SQLException {
+                return connect();
+            }
+
+            @Override
+            public <T> T unwrap(Class<T> iface) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public boolean isWrapperFor(Class<?> iface) {
+                return false;
+            }
+
+            @Override
+            public java.io.PrintWriter getLogWriter() {
+                return null;
+            }
+
+            @Override
+            public void setLogWriter(java.io.PrintWriter out) {
+            }
+
+            @Override
+            public void setLoginTimeout(int seconds) {
+            }
+
+            @Override
+            public int getLoginTimeout() {
+                return 0;
+            }
+
+            @Override
+            public java.util.logging.Logger getParentLogger() {
+                throw new UnsupportedOperationException();
+            }
+        };
+    }
+
+    /** Every {@code getConnection()} call throws -- genuinely broken, not merely unseeded. */
+    private static javax.sql.DataSource brokenDataSource() {
+        return new javax.sql.DataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                throw new SQLException("deliberately broken for dbFailureLeavesRedisUntouched");
+            }
+
+            @Override
+            public Connection getConnection(String username, String password) throws SQLException {
+                return getConnection();
+            }
+
+            @Override
+            public <T> T unwrap(Class<T> iface) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public boolean isWrapperFor(Class<?> iface) {
+                return false;
+            }
+
+            @Override
+            public java.io.PrintWriter getLogWriter() {
+                return null;
+            }
+
+            @Override
+            public void setLogWriter(java.io.PrintWriter out) {
+            }
+
+            @Override
+            public void setLoginTimeout(int seconds) {
+            }
+
+            @Override
+            public int getLoginTimeout() {
+                return 0;
+            }
+
+            @Override
+            public java.util.logging.Logger getParentLogger() {
+                throw new UnsupportedOperationException();
+            }
+        };
+    }
+
     private RevocationChecker checkerWithWorkingRedis() {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(REDIS.getHost(), REDIS.getMappedPort(6379));
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
@@ -118,7 +210,17 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15));
+    }
+
+    private RevocationChecker checkerWithWorkingRedisAndBrokenDb() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(REDIS.getHost(), REDIS.getMappedPort(6379));
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        return new RevocationChecker(brokenDataSource(), factory, CLOCK, Duration.ofMinutes(15));
     }
 
     private RevocationChecker checkerWithUnreachableRedis() throws Exception {
@@ -128,7 +230,7 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15));
     }
 
     /** Seeds two fresh, never-used refresh_token rows for the given family. */
@@ -227,19 +329,18 @@ class RevocationOrderingTest {
     @Test
     void dbFailureLeavesRedisUntouched() throws Exception {
         UUID familyId = UUID.randomUUID();
-        // Deliberately NOT seeding any rows in Postgres for this family -- there is no DataSource
-        // parameter on RevocationChecker today (see class-level note), so this test cannot yet
-        // inject a genuinely broken DataSource the way the plan doc describes; it instead proves
-        // the current no-op never creates a Redis entry out of band of a real DB write.
-        RevocationChecker checker = checkerWithWorkingRedis();
+        // A genuinely broken DataSource (every getConnection() throws) with a real, working
+        // Redis -- isolates the reverse ordering this guards against: if revokeFamily ever wrote
+        // to Redis before (or regardless of) the DB write, this test would see a Redis key here
+        // despite the DB write having failed outright.
+        RevocationChecker checker = checkerWithWorkingRedisAndBrokenDb();
 
         assertThatThrownBy(() -> checker.revokeFamily(familyId))
-                .as("revokeFamily must throw when it cannot durably record the revocation -- the "
-                        + "current no-op stub never throws at all")
+                .as("revokeFamily must throw when the database write itself fails")
                 .isInstanceOf(RuntimeException.class);
 
         assertThat(redisKeyExists("revoked:" + familyId))
-                .as("no Redis key for this family should exist without a real DB-first revocation")
+                .as("no Redis key for this family should exist when the DB write never committed")
                 .isFalse();
     }
 }

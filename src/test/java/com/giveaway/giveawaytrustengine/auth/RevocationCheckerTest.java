@@ -1,6 +1,7 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.TestImages;
+import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -11,14 +12,19 @@ import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
+import javax.sql.DataSource;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -52,6 +58,70 @@ class RevocationCheckerTest {
     static GenericContainer<?> TLS_REDIS;
     static Path certDir;
 
+    // revokeFamily now writes to refresh_token (Section 4, DB-first) -- a real Postgres is
+    // needed here too, same pattern as RevocationOrderingTest. This test class doesn't care
+    // about specific row counts (no rows are seeded for the UUIDs it uses), only that the write
+    // succeeds against a real, migrated schema.
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(TestImages.POSTGRES)
+            .withDatabaseName("revocation_checker_test")
+            .withUsername("test")
+            .withPassword("test");
+
+    static {
+        POSTGRES.start();
+        Flyway.configure()
+                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
+                .load()
+                .migrate();
+    }
+
+    private static DataSource postgresDataSource() {
+        return new DataSource() {
+            @Override
+            public Connection getConnection() throws SQLException {
+                return DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+            }
+
+            @Override
+            public Connection getConnection(String username, String password) throws SQLException {
+                return getConnection();
+            }
+
+            @Override
+            public <T> T unwrap(Class<T> iface) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public boolean isWrapperFor(Class<?> iface) {
+                return false;
+            }
+
+            @Override
+            public java.io.PrintWriter getLogWriter() {
+                return null;
+            }
+
+            @Override
+            public void setLogWriter(java.io.PrintWriter out) {
+            }
+
+            @Override
+            public void setLoginTimeout(int seconds) {
+            }
+
+            @Override
+            public int getLoginTimeout() {
+                return 0;
+            }
+
+            @Override
+            public java.util.logging.Logger getParentLogger() {
+                throw new UnsupportedOperationException();
+            }
+        };
+    }
+
     @BeforeAll
     static void startTlsRedis() throws Exception {
         certDir = Files.createTempDirectory("revocation-checker-tls");
@@ -83,6 +153,7 @@ class RevocationCheckerTest {
         if (TLS_REDIS != null) {
             TLS_REDIS.stop();
         }
+        POSTGRES.stop();
     }
 
     /**
@@ -128,7 +199,7 @@ class RevocationCheckerTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15));
     }
 
     // Failure test 10 (Section 5.10): a connection over TLS with the correct password succeeds
@@ -201,7 +272,7 @@ class RevocationCheckerTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        RevocationChecker checker = new RevocationChecker(factory, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker checker = new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15));
 
         assertThatThrownBy(() -> checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)))
                 .isInstanceOf(RevocationCheckUnavailableException.class);

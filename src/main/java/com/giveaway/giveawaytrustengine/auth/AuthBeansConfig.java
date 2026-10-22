@@ -6,6 +6,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 
+import javax.sql.DataSource;
 import java.time.Clock;
 import java.time.Duration;
 
@@ -41,11 +42,13 @@ public class AuthBeansConfig {
     }
 
     @Bean
-    public RevocationChecker revocationChecker(ObjectProvider<LettuceConnectionFactory> connectionFactory, Clock clock) {
+    public RevocationChecker revocationChecker(ObjectProvider<LettuceConnectionFactory> connectionFactory,
+            ObjectProvider<DataSource> dataSource, Clock clock) {
         LettuceConnectionFactory factory = connectionFactory.getIfAvailable();
-        if (factory == null) {
+        DataSource source = dataSource.getIfAvailable();
+        if (factory == null || source == null) {
             return null;
         }
-        return new RevocationChecker(factory, clock, Duration.ofMinutes(15));
+        return new RevocationChecker(source, factory, clock, Duration.ofMinutes(15));
     }
 }
