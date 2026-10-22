@@ -136,10 +136,21 @@ class ResolveEndpointFilterChainTest {
     }
 
     // Failure test 7 (Section 5.7): Redis down must give 503 through the REAL filter chain, not
-    // a silent 200 ("not revoked" guessed) nor a 401.
+    // a silent 200 ("not revoked" guessed) nor a 401. Uses a real, validly-signed, unexpired
+    // token -- a missing token would be rejected with 401 before the revocation check is ever
+    // reached (correctly so, per the PRD check order), which would confound this test with the
+    // separate missing-token case below rather than isolating "Redis specifically is down".
     @Test
     void redisDownOnResolveStyleEndpointReturns503() throws Exception {
-        HttpResponse<String> response = ping(portWithRedisDown, null);
+        // Real wall-clock time, not the file's fixed CLOCK -- the real running app's own
+        // JwtService verifies against Clock.systemUTC(), so a token issued against a stale fixed
+        // instant would be rejected as EXPIRED before the revocation check ever runs, which would
+        // make this test pass for the wrong reason (an expired-token 401, not a real Redis-down
+        // 503) rather than isolating the case it's named for.
+        JwtService tokenIssuer = new JwtService(SIGNING_KEY, Clock.systemUTC());
+        String validToken = tokenIssuer.issueAccessToken(UUID.randomUUID(), UUID.randomUUID());
+
+        HttpResponse<String> response = ping(portWithRedisDown, validToken);
 
         assertThat(response.statusCode())
                 .as("real observed status with Redis unreachable -- expected 503; "
@@ -191,7 +202,11 @@ class ResolveEndpointFilterChainTest {
     void revokedFamilyAccessTokenOnResolveStyleEndpointReturns401() throws Exception {
         UUID cmId = UUID.randomUUID();
         UUID familyId = UUID.randomUUID();
-        JwtService tokenIssuer = new JwtService(SIGNING_KEY, CLOCK);
+        // Real wall-clock time, not the file's fixed CLOCK -- same reasoning as
+        // redisDownOnResolveStyleEndpointReturns503 above: this must fail (once chunk 2 lands)
+        // because the family is genuinely revoked, not coincidentally because the token looks
+        // expired to the real app's real-clock verifier.
+        JwtService tokenIssuer = new JwtService(SIGNING_KEY, Clock.systemUTC());
         String tokenForRevokedFamily = tokenIssuer.issueAccessToken(cmId, familyId);
 
         // Attempt to revoke the family up front -- currently a no-op, so this has no real effect
