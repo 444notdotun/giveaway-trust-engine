@@ -2,7 +2,7 @@
 
 CRITICAL REVIEW, scoped to **reuse detection and revocation ordering** (Section 4 below) — the exact sequencing of "mark the token used" vs. "revoke the family" vs. "write to Redis" is where a race or an ordering mistake turns into a silently-not-actually-revoked session. PRD refs: Section 9 (Permissions & Security — JWT, refresh tokens, revocation), Section 3 (RefreshToken domain object), Section 15 (resolve endpoint check order). BUILD_ORDER item 3.
 
-**Flagged PRD tension, now explicitly in this slice's scope, needs PM sign-off before merge:** Section 11 ("Integrations") states "There is no direct integration with X's own API anywhere in this system." Read in context, Section 11 is specifically about the giveaway pipeline's data-collection integrations (replies/retweets/follow-checker, all routed through Apify) — Section 9 already separately specifies cookie/JWT auth with no mention of Apify for login, so this slice reads Section 11's statement as scoped to the pipeline, not to authentication. Proceeding on that reading per your answer (OAuth via X/Twitter), but this is a real PRD wording gap, not a reading either of us can fully settle alone: **the PRD itself needs an edit** — Section 11's blanket statement needs a carve-out for OAuth login, and Section 9/Section 3 need the login mechanism (currently entirely unstated) written in. Both edits are now explicitly part of this slice's deliverables, flagged as **needing PM sign-off before merge**, not something to silently patch into the PRD text ourselves. A second, related PRD wording gap surfaced in Section 0 below (the `email` field) needs the same sign-off, for the same reason.
+**PRD tension — approved by the PM on 2026-10-22.** Section 11 ("Integrations") states "There is no direct integration with X's own API anywhere in this system." Read in context, Section 11 is specifically about the giveaway pipeline's data-collection integrations (replies/retweets/follow-checker, all routed through Apify) — Section 9 already separately specifies cookie/JWT auth with no mention of Apify for login, so this slice reads Section 11's statement as scoped to the pipeline, not to authentication. The PRD itself needed an edit to say so explicitly: a carve-out for Section 11 (OAuth sign-in is the one direct X API usage — a token exchange plus one `GET /2/users/me` call, both scopes `users.read`/`tweet.read` required by that one endpoint, `tweet.read` granted but never used to read a tweet, X's own tokens discarded immediately and never stored, no other endpoint and no pipeline data ever touched this way), plus the login mechanism itself written into Section 9 and Section 3 (previously entirely unstated there). **Exact replacement text for all three is in "PRD edits to apply" at the end of this doc** — Adedotun applies it to the PRD directly; this slice doc does not edit `docs/PRD.md`. A second, separate PRD wording gap surfaced in Section 0 below (the `email` field's nullability) is **not** covered by this approval and still needs its own sign-off.
 
 ## 0. Login: OAuth 2.0 Authorization Code + PKCE against X
 
@@ -29,7 +29,7 @@ Flow: redirect CM to X's authorize URL with `code_challenge`/`state` → X redir
 
 **Schema finding, now folded into this slice's PRD-sign-off scope (header):** `community_manager` currently has no immutable X identifier — only `x_handle` (mutable; X allows handle changes) with a `UNIQUE` constraint. X's user-lookup response carries both an immutable numeric `id` and the mutable `username`. Upserting by `x_handle` means a CM who renames their X handle gets a **second, disconnected `community_manager` row** on their next login, orphaning their existing giveaways/quota under the old handle. **Proposed fix: migration `V2` adding `x_user_id text NOT NULL UNIQUE` to `community_manager`, upsert keyed on `x_user_id`, with `x_handle` refreshed (not re-keyed) on every login to stay current** (Section 5 tests this directly — a simulated handle rename must update the same row, not create a new one).
 
-**`email`: dropping the scope means this app can no longer populate it from X at all.** `community_manager.email` is currently `NOT NULL` and `UNIQUE` in the schema, but (per the grep above) the PRD never actually uses the `email` field for anything. Since `users.email` is deliberately not requested, there is no source for this column's value at login time at all — not "sometimes missing," but **never populated by this flow, ever.** This needs the same migration (`V2`) to make `email` nullable, and is part of the PRD-sign-off scope flagged in the header: the PRD's own domain model lists `email` as a plain field with no stated nullability, and this slice is changing that. **No placeholder/synthesized email is written** — a fabricated value would collide with the column's own `UNIQUE` constraint the instant two such logins happened, and would be misleading data to anyone who later reads it.
+**`email`: dropping the scope means this app can no longer populate it from X at all.** `community_manager.email` is currently `NOT NULL` and `UNIQUE` in the schema, but (per the grep above) the PRD never actually uses the `email` field for anything. Since `users.email` is deliberately not requested, there is no source for this column's value at login time at all — not "sometimes missing," but **never populated by this flow, ever.** This needs the same migration (`V2`) to make `email` nullable — **a separate PRD wording question, not covered by the Section 11/9/3 approval above and still open** (Open items 5a): the PRD's own domain model lists `email` as a plain field with no stated nullability, and this slice is changing that. **No placeholder/synthesized email is written** — a fabricated value would collide with the column's own `UNIQUE` constraint the instant two such logins happened, and would be misleading data to anyone who later reads it.
 
 ## 1. Real Redis on staging
 
@@ -158,5 +158,38 @@ Twenty-one failure tests (Section 5, including the Redis-TLS/auth pair, the seve
 2. **An actual X Developer App** (client id, client secret, registered callback URL matching this app's real domain, with `users.read` and `tweet.read` scopes available to it) must exist before this can be tested against the real X API end-to-end — I can build and unit/WireMock-test everything up to that point without it, but can't do a real end-to-end login without it existing first.
 3. **Nimbus JOSE+JWT as a new dependency**, pinned to `10.4` (Section 2) — flagged per CLAUDE.md, needs your explicit yes before it goes in `pom.xml`.
 4. **Which X API access tier is required** for `GET /2/users/me` / OAuth 2.0 login (Section 0) — not confirmable from the docs pages I checked; needs confirming against your actual X Developer Portal account before relying on it.
-5. **The PRD wording changes themselves** (header, and Section 0's `email` finding) — need PM sign-off before merge, not just engineering sign-off: Section 11's blanket "no direct integration with X's API" statement needs a carve-out, Section 9/3 need the login mechanism written in, and the domain model's `email` field needs its nullability stated.
+5. ~~The PRD wording changes themselves~~ — **approved by the PM on 2026-10-22** (header): Section 11's carve-out and the Section 9/3 login-mechanism addition. Exact text to apply is in "PRD edits to apply" below.
+5a. **The domain model's `email` field nullability** (Section 0) — a separate, still-open PRD wording question, not covered by the approval above. Still needs its own sign-off before the `V2` migration makes `email` nullable.
 6. **Frontend domain layout and redirect allow-list** (Section 0) — explicitly deferred, not decided now, since there's no real frontend yet to decide them against.
+
+## PRD edits to apply
+
+**Not applied to `docs/PRD.md` by this slice doc or this slice's code — Adedotun applies these to the Word PRD directly.** Three edits, approved by the PM on 2026-10-22 (Section 11's carve-out and the login-mechanism additions to Sections 3 and 9 — not the separate, still-open `email`-nullability question, Open item 5a).
+
+### Section 11 ("Integrations") — replace one sentence
+
+Current text (the sentence to replace, within the existing paragraph — the rest of that paragraph, about Apify and no hand-rolled webhook/retry logic, is unchanged):
+
+> There is no direct integration with X's own API anywhere in this system.
+
+Replacement:
+
+> The only direct X API usage is OAuth 2.0 sign-in: a token exchange and one GET /2/users/me call (scopes users.read, tweet.read — the latter required by that endpoint but unused for reading tweets) to learn the CM's X user id and handle. X's own tokens are discarded immediately after. No other endpoint, and no giveaway pipeline data, is ever read via a direct X API call.
+
+### Section 3 (Domain Model) — two additions
+
+**1. Add a field to the `CommunityManager` list** (after `id: UUID`, before `email: String`):
+
+```
+  - xUserId: String
+```
+
+**2. Add a short paragraph directly after the `CommunityManager` field list** (after `canRunGiveaway(): boolean`, before the `AccountQuota` heading):
+
+> A CommunityManager row is created on first login via "Sign in with X" (OAuth 2.0, Section 9) and keyed by xUserId — X's own immutable account identifier, not xHandle, since a CM renaming their X handle must resolve to the same row, not a new one. xHandle is refreshed from X on every login to stay current; it is never the identity key.
+
+### Section 9 (Permissions & Security) — add a paragraph before "Authentication"
+
+Insert this new paragraph immediately before the existing **Authentication** paragraph (that paragraph — "CM identity is established via JWT carried in an HttpOnly, Secure, SameSite=Strict cookie..." — is unchanged, this is a new paragraph ahead of it):
+
+> **Login.** A CM authenticates via "Sign in with X": OAuth 2.0 Authorization Code with PKCE against X's own authorization and token endpoints. X returns the CM's X user id and handle (via GET /2/users/me); this app issues its own JWT/refresh-token session (below) from that point on and discards X's tokens immediately. X is used only to establish identity at login — no ongoing access to the CM's X account is requested or retained.
