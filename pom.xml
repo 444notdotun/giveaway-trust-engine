@@ -121,6 +121,18 @@
             <artifactId>postgresql</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Slice 3 (Auth): mocks X's OAuth token-exchange and user-lookup endpoints.
+             Already sanctioned by CLAUDE.md's stack line ("Testcontainers, WireMock, Sentry,
+             Micrometer"); no separate approval needed, unlike Nimbus (docs/slices/03-auth.md
+             Open item 3). Standalone artifact: this project has no Spring Cloud Contract, so a
+             WireMockServer is started/stopped manually in each test rather than relying on a
+             framework-provided @WireMockTest annotation. -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>3.13.2</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

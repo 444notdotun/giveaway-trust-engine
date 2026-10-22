@@ -8,6 +8,9 @@ public final class TestImages {
 
     public static final String POSTGRES = "postgres:17-alpine";
 
+    /** Pinned to docker-compose.yaml's local Redis version (slice 3, Section 1). */
+    public static final String REDIS = "redis:7.4";
+
     private TestImages() {
     }
 }
