@@ -1,13 +1,20 @@
 package com.giveaway.giveawaytrustengine.auth;
 
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.Date;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -29,7 +36,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class JwtServiceTest {
 
-    private static final String SIGNING_KEY = "0123456789abcdef0123456789abcdef"; // 32 bytes
+    // Decodes to 32 bytes (256 bits) -- Nimbus's MACSigner/MACVerifier hard-enforce this as the
+    // HS256 minimum (item 0 of the chunk 4 review); the old 24-byte value here predated that
+    // constraint and was already below the production startup guard's own 32-byte minimum
+    // (JwtSigningKeyGuardBeanFactoryPostProcessor), so this fixture was never representative of
+    // a real key to begin with.
+    private static final String SIGNING_KEY = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
     private static final Instant FIXED_NOW = Instant.parse("2026-10-21T12:00:00Z");
 
     private static String base64Url(String json) {
@@ -95,6 +107,36 @@ class JwtServiceTest {
         JwtService service = new JwtService(SIGNING_KEY, clock);
 
         assertThatThrownBy(() -> service.verifyAccessToken(algNoneToken))
+                .isInstanceOf(JwtVerificationException.class)
+                .satisfies(ex -> assertThat(((JwtVerificationException) ex).reason())
+                        .isEqualTo("alg-confusion"));
+    }
+
+    // Item 0 (chunk 4 review): algorithm confusion via a genuinely DIFFERENT signed algorithm,
+    // not just alg:none. A token signed with HS384 is still a real SignedJWT (unlike alg:none,
+    // which parses as a PlainJWT and would be rejected by a much weaker check -- e.g. "is this
+    // even a SignedJWT instance" -- that the alg:none test alone can't distinguish from a correct
+    // HS256-only check). This isolates that the explicit HS256 pin is what's doing the work, not
+    // merely "is this token's shape signed at all."
+    @Test
+    void algorithmConfusionHs384IsRejected() throws Exception {
+        UUID cmId = UUID.randomUUID();
+        UUID familyId = UUID.randomUUID();
+        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+                .subject(cmId.toString())
+                .claim("familyId", familyId.toString())
+                .issueTime(Date.from(FIXED_NOW))
+                .expirationTime(Date.from(FIXED_NOW.plus(Duration.ofMinutes(15))))
+                .build();
+        byte[] hs384Key = new byte[48]; // HS384's own 384-bit minimum -- irrelevant to the check being tested
+        new SecureRandom().nextBytes(hs384Key);
+        SignedJWT hs384Token = new SignedJWT(new JWSHeader(JWSAlgorithm.HS384), claims);
+        hs384Token.sign(new MACSigner(hs384Key));
+
+        Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
+        JwtService service = new JwtService(SIGNING_KEY, clock);
+
+        assertThatThrownBy(() -> service.verifyAccessToken(hs384Token.serialize()))
                 .isInstanceOf(JwtVerificationException.class)
                 .satisfies(ex -> assertThat(((JwtVerificationException) ex).reason())
                         .isEqualTo("alg-confusion"));

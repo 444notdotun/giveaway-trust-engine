@@ -32,7 +32,10 @@ import static org.mockito.Mockito.when;
  */
 class CmIdExtractionTest {
 
-    private static final String SIGNING_KEY = "0123456789abcdef0123456789abcdef";
+    // Decodes to 32 bytes (256 bits) -- Nimbus's MACSigner/MACVerifier hard-enforce this as the
+    // HS256 minimum (item 0 of the chunk 4 review); the old 24-byte value here predated that
+    // constraint.
+    private static final String SIGNING_KEY = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
     private static final Instant FIXED_NOW = Instant.parse("2026-10-21T12:00:00Z");
     private static final Clock CLOCK = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
 

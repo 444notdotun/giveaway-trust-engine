@@ -2,6 +2,11 @@ package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.GiveawayTrustEngineApplication;
 import com.giveaway.giveawaytrustengine.TestImages;
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -22,6 +27,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Base64;
+import java.util.Date;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -221,6 +228,32 @@ class ResolveEndpointFilterChainTest {
                         + "revoked -- expected 401; same uncaught-exception-from-the-filter gap "
                         + "as the expired-token case above makes a 500-shaped response the "
                         + "realistic wrong answer to expect here today")
+                .isEqualTo(401);
+    }
+
+    // Item 0 (chunk 4 review, JWT library swap): a VALIDLY SIGNED token whose "sub" claim is not
+    // a parseable UUID must still be rejected cleanly with 401 through the real filter chain --
+    // never a raw 500. Hand-forges the token directly with Nimbus (bypassing JwtService, which
+    // never issues a malformed claim itself) using the real signing key, so this reaches
+    // JwtService.verifyAccessToken's claim-parsing step with a signature that genuinely verifies.
+    @Test
+    void malformedSubClaimOnValidlySignedTokenReturns401NotRawServerError() throws Exception {
+        byte[] keyBytes = Base64.getDecoder().decode(SIGNING_KEY);
+        Instant now = Instant.now();
+        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+                .subject("not-a-valid-uuid")
+                .claim("familyId", UUID.randomUUID().toString())
+                .issueTime(Date.from(now))
+                .expirationTime(Date.from(now.plus(Duration.ofMinutes(15))))
+                .build();
+        SignedJWT forged = new SignedJWT(new JWSHeader(JWSAlgorithm.HS256), claims);
+        forged.sign(new MACSigner(keyBytes));
+
+        HttpResponse<String> response = ping(portWithRedisUp, forged.serialize());
+
+        assertThat(response.statusCode())
+                .as("a malformed (non-UUID) sub claim on an otherwise validly-signed token must "
+                        + "be rejected as 401, never propagate as an uncaught exception/500")
                 .isEqualTo(401);
     }
 }

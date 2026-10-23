@@ -133,6 +133,18 @@
             <version>3.13.2</version>
             <scope>test</scope>
         </dependency>
+        <!-- Slice 3 (Auth), item 0 of the chunk 4 review: approved by the user on 2026-10-23.
+             Pinned to the current stable release (verified against Maven Central's own
+             maven-metadata.xml at approval time: the plan doc's original "10.4" was six
+             releases stale). Verified against Snyk: zero open vulnerabilities for this version;
+             the one historical CVE (CVE-2025-53864, DoS via recursive JSON in a crafted claim
+             set) was fixed in 10.0.2, well below this pin. See docs/slices/03-auth.md, Section 2,
+             "Open item 3, CLOSED". -->
+        <dependency>
+            <groupId>com.nimbusds</groupId>
+            <artifactId>nimbus-jose-jwt</artifactId>
+            <version>10.10</version>
+        </dependency>
     </dependencies>
 
     <build>
