@@ -41,6 +41,21 @@ final class PkceChallenge {
         return HexFormat.of().formatHex(bytes);
     }
 
+    /**
+     * 20 random bytes (160 bits), base64url (no padding) -- the anti-CSRF nonce bound to the
+     * browser that started the login (chunk 4 review, item 1). Well over the 128-bit minimum.
+     */
+    static String generateBindingNonce() {
+        byte[] bytes = new byte[20];
+        RANDOM.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /** Hex-encoded SHA-256 of an arbitrary string -- used to hash the binding nonce for storage. */
+    static String sha256Hex(String value) {
+        return HexFormat.of().formatHex(sha256(value));
+    }
+
     private static byte[] sha256(String value) {
         try {
             return MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
