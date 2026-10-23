@@ -75,8 +75,11 @@ class OAuthLoginFlowTest {
             .withUsername("test")
             .withPassword("test");
 
+    private static final String REDIS_PASSWORD = "test-redis-password";
+
     static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse(TestImages.REDIS))
-            .withExposedPorts(6379);
+            .withExposedPorts(6379)
+            .withCommand("redis-server", "--requirepass", REDIS_PASSWORD);
 
     static WireMockServer wireMock;
     static ConfigurableApplicationContext appContext;
@@ -103,6 +106,7 @@ class OAuthLoginFlowTest {
                         "--spring.datasource.password=" + POSTGRES.getPassword(),
                         "--spring.data.redis.host=" + REDIS.getHost(),
                         "--spring.data.redis.port=" + REDIS.getMappedPort(6379),
+                        "--spring.data.redis.password=" + REDIS_PASSWORD,
                         "--app.environment=DEV",
                         "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                         "--app.bachs.live-base-url=https://api.bachs.io",
@@ -211,6 +215,7 @@ class OAuthLoginFlowTest {
      */
     private String readStoredStateValue(String state) {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(REDIS.getHost(), REDIS.getMappedPort(6379));
+        config.setPassword(REDIS_PASSWORD);
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, LettuceClientConfiguration.builder()
                 .commandTimeout(Duration.ofSeconds(2)).build());
         factory.afterPropertiesSet();
@@ -241,6 +246,7 @@ class OAuthLoginFlowTest {
         String newStoredValue = newVerifier + ":" + bindingHashHex;
 
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(REDIS.getHost(), REDIS.getMappedPort(6379));
+        config.setPassword(REDIS_PASSWORD);
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, LettuceClientConfiguration.builder()
                 .commandTimeout(Duration.ofSeconds(2)).build());
         factory.afterPropertiesSet();
@@ -627,6 +633,7 @@ class OAuthLoginFlowTest {
 
         RedisStandaloneConfiguration redisConfig = new RedisStandaloneConfiguration(
                 REDIS.getHost(), REDIS.getMappedPort(6379));
+        redisConfig.setPassword(REDIS_PASSWORD);
         LettuceConnectionFactory factory = new LettuceConnectionFactory(redisConfig,
                 LettuceClientConfiguration.builder().commandTimeout(Duration.ofSeconds(2)).build());
         factory.afterPropertiesSet();
@@ -857,6 +864,7 @@ class OAuthLoginFlowTest {
     /** Raw Redis TTL (seconds), via the same Lettuce pattern used elsewhere in this file. */
     private Long ttlOf(String key) {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(REDIS.getHost(), REDIS.getMappedPort(6379));
+        config.setPassword(REDIS_PASSWORD);
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, LettuceClientConfiguration.builder()
                 .commandTimeout(Duration.ofSeconds(2)).build());
         factory.afterPropertiesSet();

@@ -63,8 +63,11 @@ class ResolveEndpointFilterChainTest {
             .withUsername("test")
             .withPassword("test");
 
+    private static final String REDIS_PASSWORD = "test-redis-password";
+
     static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse(TestImages.REDIS))
-            .withExposedPorts(6379);
+            .withExposedPorts(6379)
+            .withCommand("redis-server", "--requirepass", REDIS_PASSWORD);
 
     static ConfigurableApplicationContext appWithRedisUp;
     static ConfigurableApplicationContext appWithRedisDown;
@@ -102,6 +105,7 @@ class ResolveEndpointFilterChainTest {
                         "--spring.datasource.password=" + POSTGRES.getPassword(),
                         "--spring.data.redis.host=" + redisHost,
                         "--spring.data.redis.port=" + redisPort,
+                        "--spring.data.redis.password=" + REDIS_PASSWORD,
                         "--spring.data.redis.timeout=1000",
                         "--spring.data.redis.connect-timeout=1000",
                         "--app.environment=DEV",

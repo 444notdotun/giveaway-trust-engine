@@ -97,7 +97,11 @@ class StartupGuardTest {
                         "app.environment=DEV",
                         "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
                         "app.bachs.live-base-url=" + FAKE_LIVE_URL,
-                        "app.bachs.base-url=" + FAKE_SANDBOX_URL)
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(output.getOut()).contains("INFO").contains("DEV").contains("SANDBOX");
@@ -151,7 +155,12 @@ class StartupGuardTest {
                         "app.environment=PRODUCTION",
                         "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
                         "app.bachs.live-base-url=" + FAKE_LIVE_URL,
-                        "app.bachs.base-url=" + FAKE_LIVE_URL)
+                        "app.bachs.base-url=" + FAKE_LIVE_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password",
+                        "spring.data.redis.ssl.enabled=true")
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(output.getOut()).contains("INFO").contains("PRODUCTION").contains("LIVE");
@@ -659,11 +668,260 @@ class StartupGuardTest {
                 "--app.bachs.sandbox-base-url=https://sandbox-api.bachs.io",
                 "--app.bachs.live-base-url=https://api.bachs.io",
                 "--app.bachs.base-url=https://sandbox-api.bachs.io",
-                "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
+                "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+                "--app.x-oauth.client-id=fake-client-id",
+                "--app.x-oauth.client-secret=fake-client-secret",
+                "--app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                "--spring.data.redis.password=fake-redis-password");
         try {
             assertThat(context.isActive()).isTrue();
         } finally {
             context.close();
         }
+    }
+
+    // Chunk 4 review, item 3: the same isUnset rule, extended to the OAuth client credentials
+    // and the Redis password.
+    @Test
+    void missingXOauthClientIdRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("app.x-oauth.client-id");
+                    assertErrorLogLine(output, "app.x-oauth.client-id");
+                });
+    }
+
+    @Test
+    void placeholderXOauthClientIdRefuses(CapturedOutput output) {
+        guardedContextWithRawProperty("app.x-oauth.client-id", "${X_OAUTH_CLIENT_ID}")
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("app.x-oauth.client-id");
+                    assertErrorLogLine(output, "app.x-oauth.client-id");
+                });
+    }
+
+    @Test
+    void missingXOauthClientSecretRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("app.x-oauth.client-secret");
+                    assertErrorLogLine(output, "app.x-oauth.client-secret");
+                    // The actual secret value must never appear in the refusal message/log --
+                    // only the property NAME, per instruction ("never the value").
+                    assertThat(output.getAll()).doesNotContain("fake-client-id");
+                });
+    }
+
+    @Test
+    void missingXOauthRedirectUriRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("app.x-oauth.redirect-uri");
+                    assertErrorLogLine(output, "app.x-oauth.redirect-uri");
+                });
+    }
+
+    @Test
+    void missingRedisPasswordRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("spring.data.redis.password");
+                    assertErrorLogLine(output, "spring.data.redis.password");
+                });
+    }
+
+    @Test
+    void blankRedisPasswordRefuses(CapturedOutput output) {
+        guardedContextWithRawProperty("spring.data.redis.password", "")
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("spring.data.redis.password");
+                    assertErrorLogLine(output, "spring.data.redis.password");
+                });
+    }
+
+    // Chunk 4 review, item 3: STAGING additionally requires spring.data.redis.ssl.enabled to be
+    // the EXACT string "true" -- missing, blank, wrong case, or padded with whitespace all refuse.
+    @Test
+    void stagingMissingRedisTlsEnabledRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=STAGING",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("spring.data.redis.ssl.enabled");
+                    assertErrorLogLine(output, "spring.data.redis.ssl.enabled");
+                });
+    }
+
+    @Test
+    void stagingWrongCaseRedisTlsEnabledRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=STAGING",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password",
+                        "spring.data.redis.ssl.enabled=TRUE")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("spring.data.redis.ssl.enabled");
+                });
+    }
+
+    @Test
+    void stagingWhitespacePaddedRedisTlsEnabledRefuses(CapturedOutput output) {
+        guardedContextWithRawProperty("spring.data.redis.ssl.enabled", " true ")
+                .withPropertyValues(
+                        "app.environment=STAGING",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context)
+                            .as("no trim -- \" true \" with surrounding whitespace must NOT be "
+                                    + "accepted as the exact string \"true\"")
+                            .hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root.getMessage()).contains("spring.data.redis.ssl.enabled");
+                });
+    }
+
+    @Test
+    void stagingExactlyTrueRedisTlsEnabledStarts(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=STAGING",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password",
+                        "spring.data.redis.ssl.enabled=true")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Test
+    void productionMissingRedisTlsEnabledRefuses(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=PRODUCTION",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_LIVE_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(StartupGuardException.class);
+                    assertThat(root.getMessage()).contains("spring.data.redis.ssl.enabled");
+                    assertErrorLogLine(output, "spring.data.redis.ssl.enabled");
+                });
+    }
+
+    // DEV's local, unauthenticated Redis container never needs TLS -- the ssl.enabled check
+    // must not apply there at all, even though it's absent.
+    @Test
+    void devDoesNotRequireRedisTlsEnabled(CapturedOutput output) {
+        guardedContext()
+                .withPropertyValues(
+                        "app.environment=DEV",
+                        "app.bachs.sandbox-base-url=" + FAKE_SANDBOX_URL,
+                        "app.bachs.live-base-url=" + FAKE_LIVE_URL,
+                        "app.bachs.base-url=" + FAKE_SANDBOX_URL,
+                        "app.x-oauth.client-id=fake-client-id",
+                        "app.x-oauth.client-secret=fake-client-secret",
+                        "app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                        "spring.data.redis.password=fake-redis-password")
+                .run(context -> assertThat(context).hasNotFailed());
     }
 }

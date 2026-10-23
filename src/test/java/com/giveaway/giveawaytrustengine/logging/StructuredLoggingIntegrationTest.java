@@ -55,6 +55,10 @@ class StructuredLoggingIntegrationTest {
                 "--app.bachs.live-base-url=https://api.bachs.io",
                 "--app.bachs.base-url=https://sandbox-api.bachs.io",
                 "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+                "--app.x-oauth.client-id=fake-client-id",
+                "--app.x-oauth.client-secret=fake-client-secret",
+                "--app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                "--spring.data.redis.password=fake-redis-password",
                 "--server.port=0",
                 "--logging.structured.format.console=ecs"));
         args.addAll(List.of(extra));
@@ -79,6 +83,10 @@ class StructuredLoggingIntegrationTest {
                 "--app.bachs.live-base-url=https://api.bachs.io",
                 "--app.bachs.base-url=https://sandbox-api.bachs.io",
                 "--app.jwt.signing-key=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+                "--app.x-oauth.client-id=fake-client-id",
+                "--app.x-oauth.client-secret=fake-client-secret",
+                "--app.x-oauth.redirect-uri=https://example.test/auth/callback",
+                "--spring.data.redis.password=fake-redis-password",
                 "--server.port=0"
         };
     }

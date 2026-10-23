@@ -70,6 +70,7 @@ class OAuthRedisUnavailableTest {
                         "--spring.datasource.password=" + POSTGRES.getPassword(),
                         "--spring.data.redis.host=127.0.0.1",
                         "--spring.data.redis.port=" + unreachableRedisPort,
+                        "--spring.data.redis.password=fake-redis-password",
                         "--spring.data.redis.timeout=1000",
                         "--spring.data.redis.connect-timeout=1000",
                         "--app.environment=DEV",
