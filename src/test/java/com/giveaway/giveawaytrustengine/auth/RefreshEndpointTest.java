@@ -79,9 +79,10 @@ class RefreshEndpointTest {
                 .web(WebApplicationType.SERVLET)
                 .run(
                         "--server.port=0",
-                        "--spring.datasource.url=" + POSTGRES.getJdbcUrl() + "&options=-c%20statement_timeout%3D3000",
+                        "--spring.datasource.url=" + POSTGRES.getJdbcUrl(),
                         "--spring.datasource.username=" + POSTGRES.getUsername(),
                         "--spring.datasource.password=" + POSTGRES.getPassword(),
+                        "--spring.datasource.hikari.connection-init-sql=SET statement_timeout=3000",
                         "--spring.data.redis.host=" + REDIS.getHost(),
                         "--spring.data.redis.port=" + REDIS.getMappedPort(6379),
                         "--spring.data.redis.password=" + REDIS_PASSWORD,
