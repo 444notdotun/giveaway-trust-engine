@@ -1,6 +1,8 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.VerificationException;
+import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder;
 import com.giveaway.giveawaytrustengine.GiveawayTrustEngineApplication;
 import com.giveaway.giveawaytrustengine.TestImages;
 import org.junit.jupiter.api.AfterAll;
@@ -119,8 +121,16 @@ class OAuthLoginFlowTest {
                         "--app.x-oauth.authorize-url=https://x.com/i/oauth2/authorize",
                         "--app.x-oauth.token-url=" + wireMock.baseUrl() + "/2/oauth2/token",
                         "--app.x-oauth.user-lookup-url=" + wireMock.baseUrl() + "/2/users/me",
-                        "--app.x-oauth.connect-timeout=500ms",
-                        "--app.x-oauth.request-timeout=500ms");
+                        // Chunk 4 review (final round), item 4: was 500ms -- too tight a margin
+                        // against real scheduling jitter on a loopback call to the embedded
+                        // WireMock server under a loaded test run (the whole Maven suite running
+                        // many Testcontainers-backed classes), which could occasionally trip this
+                        // deadline before the TCP connect to WireMock even completed, so WireMock
+                        // never saw the request at all (zero journal entries, not a slow one).
+                        // Matches the production default (application.properties) instead of an
+                        // artificially tight value chosen only to keep this test fast.
+                        "--app.x-oauth.connect-timeout=2000ms",
+                        "--app.x-oauth.request-timeout=2000ms");
 
         appPort = appContext.getEnvironment().getProperty("local.server.port", Integer.class);
     }
@@ -140,6 +150,38 @@ class OAuthLoginFlowTest {
     @AfterEach
     void resetStubs() {
         wireMock.resetAll();
+    }
+
+    /**
+     * Chunk 4 review (final round), item 4: a bounded, polling wait for WireMock's request
+     * journal, not a single immediate check -- by the time the app's HTTP call returns, the
+     * request it sent has already been journaled by WireMock (requests are recorded on receipt,
+     * before the configured response delay is even applied), so this is purely defensive against
+     * any eventual-consistency lag in WireMock's own journal rather than the mechanism the
+     * previously-observed flake traced back to (see the 2000ms connect/request-timeout comment
+     * above -- that was the real fix). No fixed sleep: this returns the instant the request shows
+     * up, and only blocks the full bound if it never does.
+     */
+    private static void awaitWireMockRequest(RequestPatternBuilder pattern) {
+        long deadlineNanos = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+        while (true) {
+            try {
+                wireMock.verify(pattern);
+                return;
+            }
+            catch (VerificationException stillMissing) {
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw stillMissing;
+                }
+            }
+            try {
+                Thread.sleep(25);
+            }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while awaiting a WireMock request", interrupted);
+            }
+        }
     }
 
     private String baseUri() {
@@ -341,11 +383,19 @@ class OAuthLoginFlowTest {
     // Chunk 4 review, item 2: this rejection must also log a WARN tagged reason=missing-state-or-code.
     @Test
     void missingStateOnCallbackIsRejected(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double before = meterRegistry.counter("giveaway.auth.failure", "reason", "missing-state-or-code").count();
+
         HttpResponse<String> response = callback("code=some-code");
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(500);
         assertThat(output.getAll())
                 .as("the failure-reason log must name the category")
                 .contains("reason=missing-state-or-code");
+        // Chunk 4 review (final round), item 2: one counter name for every auth failure --
+        // giveaway.auth.failure, not a separate giveaway.oauth.failure for this controller.
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "missing-state-or-code").count())
+                .isGreaterThan(before);
     }
 
     // Chunk 4 review, item 2: this rejection must log a WARN tagged
@@ -353,6 +403,10 @@ class OAuthLoginFlowTest {
     // state value itself -- only the fixed category.
     @Test
     void unknownStateOnCallbackIsRejected(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double before = meterRegistry.counter("giveaway.auth.failure", "reason", "unknown-or-replayed-state").count();
+
         String unknownState = "totally-unknown-state-value-" + UUID.randomUUID();
         HttpResponse<String> response = callback("code=some-code&state=" + unknownState);
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(500);
@@ -362,6 +416,8 @@ class OAuthLoginFlowTest {
         assertThat(output.getAll())
                 .as("the real (unknown) state value must never appear in any captured log line")
                 .doesNotContain(unknownState);
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "unknown-or-replayed-state").count())
+                .isGreaterThan(before);
     }
 
     // Failure test 14 (Section 5.14): state replay -- using a state a second time, after its
@@ -425,12 +481,18 @@ class OAuthLoginFlowTest {
     // never echo X's own raw error text ("access_denied") into the log.
     @Test
     void xsOwnCallbackErrorParameterHandledCleanly(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double before = meterRegistry.counter("giveaway.auth.failure", "reason", "x-error-param").count();
+
         HttpResponse<String> response = callback("error=access_denied");
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(500);
         assertThat(response.statusCode()).isNotEqualTo(500);
         assertThat(output.getAll())
                 .as("the failure-reason log must name the category")
                 .contains("reason=x-error-param");
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "x-error-param").count())
+                .isGreaterThan(before);
     }
 
     // Failure test 17 (Section 5.17), sub-case A: an X timeout during the TOKEN EXCHANGE call
@@ -439,11 +501,15 @@ class OAuthLoginFlowTest {
     // that log must never contain the real code or X access token values.
     @Test
     void timeoutDuringTokenExchangeLeavesNoHalfCreatedCommunityManagerRow(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double failuresBefore = meterRegistry.counter("giveaway.auth.failure", "reason", "x-exchange-failed").count();
+
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
         String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
         String code = "code-" + UUID.randomUUID();
-        stubTokenExchangeDelayed(code, 3000); // far past the 500ms configured timeout
+        stubTokenExchangeDelayed(code, 5000); // far past the 2000ms configured timeout
 
         int before = countAllCommunityManagers();
         HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
@@ -451,7 +517,7 @@ class OAuthLoginFlowTest {
         // FIRST: the app must have actually attempted the token exchange at all -- this is the
         // assertion that fails against the current 501-returning stub, which never calls out to
         // X in the first place, so there is nothing real for the rest of this test to prove yet.
-        wireMock.verify(postRequestedFor(urlPathEqualTo("/2/oauth2/token")));
+        awaitWireMockRequest(postRequestedFor(urlPathEqualTo("/2/oauth2/token")));
 
         // THEN: a clean 4xx/5xx-but-not-crashed response shape, not an unhandled exception.
         assertThat(response.statusCode()).isNotEqualTo(500);
@@ -468,6 +534,8 @@ class OAuthLoginFlowTest {
         assertThat(output.getAll())
                 .as("the real code value must never appear in any captured log line")
                 .doesNotContain(code);
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "x-exchange-failed").count())
+                .isGreaterThan(failuresBefore);
     }
 
     // Failure test 17 (Section 5.17), sub-case B: an X timeout during the USER LOOKUP call
@@ -480,7 +548,7 @@ class OAuthLoginFlowTest {
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupDelayed(accessToken, 3000); // far past the 500ms configured timeout
+        stubUserLookupDelayed(accessToken, 5000); // far past the 2000ms configured timeout
 
         int before = countAllCommunityManagers();
         HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
@@ -488,7 +556,7 @@ class OAuthLoginFlowTest {
         // FIRST: the app must have actually attempted the user lookup (which requires the token
         // exchange to have already succeeded first) -- fails against the current 501-returning
         // stub, which never calls out to X at all.
-        wireMock.verify(getRequestedFor(urlPathEqualTo("/2/users/me")));
+        awaitWireMockRequest(getRequestedFor(urlPathEqualTo("/2/users/me")));
 
         assertThat(response.statusCode()).isNotEqualTo(500);
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(600);
@@ -507,6 +575,10 @@ class OAuthLoginFlowTest {
     @Test
     @org.junit.jupiter.api.Timeout(value = 20, unit = java.util.concurrent.TimeUnit.SECONDS)
     void dbFailureDuringUpsertReturns503AndCreatesNoHalfCreatedRow(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double failuresBefore = meterRegistry.counter("giveaway.auth.failure", "reason", "db-unavailable").count();
+
         String xUserId = uniqueNumericXUserId();
 
         try (Connection setup = DriverManager.getConnection(
@@ -552,6 +624,8 @@ class OAuthLoginFlowTest {
             assertThat(output.getAll())
                     .as("the failure-reason log must name the category")
                     .contains("reason=db-unavailable");
+            assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "db-unavailable").count())
+                    .isGreaterThan(failuresBefore);
         } finally {
             lockHolder.rollback();
             lockHolder.close();
@@ -1155,6 +1229,11 @@ class OAuthLoginFlowTest {
     // reason=missing-or-mismatched-binding-cookie.
     @Test
     void callbackWithValidStateAndCodeButMissingBindingCookieIsRejected(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double failuresBefore = meterRegistry
+                .counter("giveaway.auth.failure", "reason", "missing-or-mismatched-binding-cookie").count();
+
         String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
@@ -1181,6 +1260,9 @@ class OAuthLoginFlowTest {
         assertThat(output.getAll())
                 .as("the failure-reason log must name the category")
                 .contains("reason=missing-or-mismatched-binding-cookie");
+        assertThat(meterRegistry
+                .counter("giveaway.auth.failure", "reason", "missing-or-mismatched-binding-cookie").count())
+                .isGreaterThan(failuresBefore);
     }
 
     // Chunk 4 review, item 1: a callback with the WRONG oauthBinding cookie is rejected, and the
@@ -1244,6 +1326,10 @@ class OAuthLoginFlowTest {
     // reason=state-or-code-too-long, and that log must never contain the oversized code itself.
     @Test
     void oversizedCodeIsRejectedWithoutBurningTheState(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double failuresBefore = meterRegistry.counter("giveaway.auth.failure", "reason", "state-or-code-too-long").count();
+
         String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
@@ -1259,6 +1345,8 @@ class OAuthLoginFlowTest {
         assertThat(output.getAll())
                 .as("the oversized code value must never appear in any captured log line")
                 .doesNotContain(oversizedCode);
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "state-or-code-too-long").count())
+                .isGreaterThan(failuresBefore);
 
         String normalCode = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
