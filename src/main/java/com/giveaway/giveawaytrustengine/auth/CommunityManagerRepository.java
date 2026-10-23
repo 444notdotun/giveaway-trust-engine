@@ -1,5 +1,10 @@
 package com.giveaway.giveawaytrustengine.auth;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -41,12 +46,23 @@ import java.util.UUID;
  */
 public class CommunityManagerRepository {
 
+    private static final Logger log = LoggerFactory.getLogger(CommunityManagerRepository.class);
+
+    /** Chunk 4 review, item 1: one counter, tagged by reason, for every auth failure path. */
+    private static final String FAILURE_COUNTER_NAME = "giveaway.auth.failure";
+
     private final DataSource dataSource;
     private final Clock clock;
+    private final MeterRegistry meterRegistry;
 
     public CommunityManagerRepository(DataSource dataSource, Clock clock) {
+        this(dataSource, clock, new SimpleMeterRegistry());
+    }
+
+    public CommunityManagerRepository(DataSource dataSource, Clock clock, MeterRegistry meterRegistry) {
         this.dataSource = dataSource;
         this.clock = clock;
+        this.meterRegistry = meterRegistry;
     }
 
     public record UpsertResult(UUID cmId, boolean isNew) {
@@ -67,12 +83,20 @@ public class CommunityManagerRepository {
             }
             catch (SQLException e) {
                 conn.rollback();
+                recordFailure();
                 throw new IllegalStateException("failed to upsert community manager", e);
             }
         }
         catch (SQLException e) {
+            recordFailure();
             throw new IllegalStateException("failed to upsert community manager", e);
         }
+    }
+
+    /** Never logs the SQL text, xUserId, or x_handle value -- only the fixed reason category. */
+    private void recordFailure() {
+        log.warn("community manager upsert rejected: reason=db-unavailable");
+        meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "db-unavailable").increment();
     }
 
     private UUID upsertCommunityManager(Connection conn, UUID candidateId, String xUserId, String xHandle)

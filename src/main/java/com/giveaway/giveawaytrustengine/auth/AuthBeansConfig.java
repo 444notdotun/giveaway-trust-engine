@@ -76,12 +76,13 @@ public class AuthBeansConfig {
 
     /** Returns {@code null} in contexts without a real {@code DataSource} -- same reasoning as above. */
     @Bean
-    public CommunityManagerRepository communityManagerRepository(ObjectProvider<DataSource> dataSource, Clock clock) {
+    public CommunityManagerRepository communityManagerRepository(ObjectProvider<DataSource> dataSource, Clock clock,
+            MeterRegistry meterRegistry) {
         DataSource source = dataSource.getIfAvailable();
         if (source == null) {
             return null;
         }
-        return new CommunityManagerRepository(source, clock);
+        return new CommunityManagerRepository(source, clock, meterRegistry);
     }
 
     /** Returns {@code null} in contexts without a real {@code DataSource} -- same reasoning as above. */

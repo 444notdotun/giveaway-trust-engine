@@ -116,6 +116,8 @@ public class RevocationChecker {
             ps.executeUpdate();
         }
         catch (SQLException dbFailure) {
+            log.warn("family revocation rejected: reason=db-unavailable familyId={}", familyId);
+            meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "db-unavailable").increment();
             throw new IllegalStateException("failed to revoke family in the database", dbFailure);
         }
     }

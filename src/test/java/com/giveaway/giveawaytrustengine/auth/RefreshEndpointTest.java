@@ -310,10 +310,14 @@ class RefreshEndpointTest {
     // with "which outcome happened must never be observable from the response."
     @Test
     @org.junit.jupiter.api.Timeout(value = 15, unit = java.util.concurrent.TimeUnit.SECONDS)
-    void dbFailureDuringRefreshReturns503() throws Exception {
+    void dbFailureDuringRefreshReturns503(CapturedOutput output) throws Exception {
         UUID familyId = UUID.randomUUID();
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertFreshToken(tokenId, familyId, false, Instant.now().plus(Duration.ofDays(7)));
+
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double before = meterRegistry.counter("giveaway.auth.failure", "reason", "db-unavailable").count();
 
         Connection lockHolder = rawConnection();
         lockHolder.setAutoCommit(false);
@@ -330,6 +334,16 @@ class RefreshEndpointTest {
                             + "would mean the token itself is invalid")
                     .isEqualTo(503);
             assertThat(response.body()).isEmpty();
+
+            assertThat(output.getAll())
+                    .as("the failure-reason log must name the category")
+                    .contains("reason=db-unavailable");
+            assertThat(output.getAll())
+                    .as("the real cookie/secret value must never appear in any captured log line")
+                    .doesNotContain(cookieValue);
+            assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "db-unavailable").count())
+                    .as("the db-unavailable counter must have incremented")
+                    .isGreaterThan(before);
         } finally {
             lockHolder.rollback();
             lockHolder.close();

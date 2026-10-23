@@ -135,7 +135,7 @@ public class RefreshTokenService {
     public RefreshResult issueInitialRefreshToken(UUID cmId, UUID familyId) {
         UUID newTokenId = UUID.randomUUID();
         byte[] newSecret = randomSecret();
-        insertNewToken(dataSource, newTokenId, familyId, cmId, newSecret, clock.instant().plus(REFRESH_TOKEN_LIFETIME));
+        insertNewToken(newTokenId, familyId, cmId, newSecret, clock.instant().plus(REFRESH_TOKEN_LIFETIME));
 
         String newAccessToken = jwtService.issueAccessToken(cmId, familyId);
         String newCookieValue = buildCookieValue(newTokenId, newSecret);
@@ -180,16 +180,17 @@ public class RefreshTokenService {
             }
             catch (SQLException e) {
                 conn.rollback();
+                recordFailure("db-unavailable");
                 throw new IllegalStateException("failed to rotate refresh token", e);
             }
         }
         catch (SQLException e) {
+            recordFailure("db-unavailable");
             throw new IllegalStateException("failed to rotate refresh token", e);
         }
     }
 
-    private static void insertNewToken(DataSource dataSource, UUID tokenId, UUID familyId, UUID cmId,
-            byte[] secret, Instant expiresAt) {
+    private void insertNewToken(UUID tokenId, UUID familyId, UUID cmId, byte[] secret, Instant expiresAt) {
         try (Connection conn = dataSource.getConnection();
                 PreparedStatement ps = conn.prepareStatement(
                         "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
@@ -202,6 +203,7 @@ public class RefreshTokenService {
             ps.executeUpdate();
         }
         catch (SQLException e) {
+            recordFailure("db-unavailable");
             throw new IllegalStateException("failed to issue refresh token", e);
         }
     }
@@ -240,6 +242,7 @@ public class RefreshTokenService {
             }
         }
         catch (SQLException e) {
+            recordFailure("db-unavailable");
             throw new IllegalStateException("failed to look up refresh token", e);
         }
     }
