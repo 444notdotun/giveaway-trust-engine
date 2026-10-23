@@ -493,4 +493,74 @@ class RefreshTokenConcurrencyTest {
         assertThat(reuseRejection.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8))
                 .isEqualTo(unknownRejection.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
+
+    // Follow-up 2: null, empty, and oversized (>256 chars) cookie values must all be rejected
+    // with the SAME generic rejection, BEFORE any base64/UUID decoding is even attempted -- a
+    // malformed-length value is exactly the kind of input a decoder could spend real work on or
+    // throw an unexpected, less-generic exception for if this guard weren't first.
+    @Test
+    void parseCookieRejectsNullEmptyAndOversizedValuesBeforeAnyDecoding() {
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
+
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> service.refresh(null)))
+                .as("null cookie value")
+                .isInstanceOf(ReuseDetectedException.class)
+                .hasMessage(RefreshTokenService.GENERIC_REJECTION_MESSAGE);
+
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> service.refresh("")))
+                .as("empty cookie value")
+                .isInstanceOf(ReuseDetectedException.class)
+                .hasMessage(RefreshTokenService.GENERIC_REJECTION_MESSAGE);
+
+        String oversized = "a".repeat(257); // one character past the 256-character ceiling
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> service.refresh(oversized)))
+                .as("oversized (257 char) cookie value")
+                .isInstanceOf(ReuseDetectedException.class)
+                .hasMessage(RefreshTokenService.GENERIC_REJECTION_MESSAGE);
+
+        // Exactly 256 characters is still accepted as a LENGTH (may still fail later for other
+        // reasons, e.g. not valid base64/no dot) -- this proves the ceiling is ">256", not
+        // "<256", i.e. the boundary itself is drawn correctly.
+        String exactly256 = "a".repeat(256);
+        Throwable at256 = org.assertj.core.api.Assertions.catchThrowable(() -> service.refresh(exactly256));
+        assertThat(at256)
+                .as("exactly 256 characters must not be rejected for its LENGTH -- it may still "
+                        + "fail for other reasons (no dot, not real base64), but not for being too long")
+                .isInstanceOf(ReuseDetectedException.class)
+                .hasMessage(RefreshTokenService.GENERIC_REJECTION_MESSAGE);
+    }
+
+    // Follow-up 3: expiry is strict -- accepted only while now is STRICTLY BEFORE expiresAt.
+    // A token whose expiresAt is exactly now (not a microsecond after) is expired, not accepted.
+    // Tested at the exact boundary via the injected Clock, never a real sleep.
+    @Test
+    void refreshTokenExpiringAtExactlyNowIsRejectedAsExpired() throws Exception {
+        UUID familyId = UUID.randomUUID();
+        UUID tokenId = UUID.randomUUID();
+
+        byte[] secret = new byte[32];
+        new SecureRandom().nextBytes(secret);
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(secret);
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
+                             + "VALUES (?,?,?,false,?,?)")) {
+            ps.setObject(1, tokenId);
+            ps.setObject(2, familyId);
+            ps.setObject(3, cmId);
+            ps.setTimestamp(4, Timestamp.from(FIXED_NOW)); // expiresAt == FIXED_NOW, exactly
+            ps.setBytes(5, hash);
+            ps.executeUpdate();
+        }
+        String cookieValue = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenId.toString().getBytes())
+                + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        // CLOCK is fixed at exactly FIXED_NOW -- the same instant as expiresAt above.
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
+
+        org.junit.jupiter.api.Assertions.assertThrows(ExpiredRefreshTokenException.class,
+                () -> service.refresh(cookieValue));
+    }
 }

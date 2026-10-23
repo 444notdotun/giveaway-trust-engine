@@ -87,7 +87,10 @@ public class RefreshTokenService {
         if (row == null || !secretMatches(parsed.secret(), row.tokenHash())) {
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
-        if (clock.instant().isAfter(row.expiresAt())) {
+        // Strict: accepted only while now is BEFORE expiresAt. now == expiresAt (not just
+        // now.isAfter) is already expired -- the boundary instant itself does not get one more
+        // accepted use.
+        if (!clock.instant().isBefore(row.expiresAt())) {
             throw new ExpiredRefreshTokenException("refresh token expired");
         }
 
@@ -227,7 +230,19 @@ public class RefreshTokenService {
     private record ParsedCookie(UUID tokenId, byte[] secret) {
     }
 
+    private static final int MAX_COOKIE_LENGTH = 256;
+
+    /**
+     * Length/presence is checked BEFORE any decoding is even attempted -- {@code null}, empty,
+     * and oversized (over {@value #MAX_COOKIE_LENGTH} characters) values are exactly the kind of
+     * input a decoder could either throw an unexpected, less-generic exception for ({@code
+     * NullPointerException} on {@code null}) or spend real work on (an attacker-sized string).
+     * Checked first, rejected the same generic way as every other malformed case.
+     */
     private static ParsedCookie parseCookie(String cookieValue) {
+        if (cookieValue == null || cookieValue.isEmpty() || cookieValue.length() > MAX_COOKIE_LENGTH) {
+            throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
+        }
         int dot = cookieValue.indexOf('.');
         if (dot < 0) {
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
