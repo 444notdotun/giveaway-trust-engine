@@ -24,8 +24,11 @@ class GiveawayTrustEngineApplicationTests {
             .withUsername("test")
             .withPassword("test");
 
+    private static final String REDIS_PASSWORD = "test-redis-password";
+
     static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
-            .withExposedPorts(6379);
+            .withExposedPorts(6379)
+            .withCommand("redis-server", "--requirepass", REDIS_PASSWORD);
 
     static {
         POSTGRES.start();
@@ -39,10 +42,15 @@ class GiveawayTrustEngineApplicationTests {
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+        registry.add("spring.data.redis.password", () -> REDIS_PASSWORD);
         registry.add("app.environment", () -> "DEV");
         registry.add("app.bachs.sandbox-base-url", () -> "https://sandbox-api.bachs.io");
         registry.add("app.bachs.live-base-url", () -> "https://api.bachs.io");
         registry.add("app.bachs.base-url", () -> "https://sandbox-api.bachs.io");
+        registry.add("app.jwt.signing-key", () -> "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
+        registry.add("app.x-oauth.client-id", () -> "fake-client-id");
+        registry.add("app.x-oauth.client-secret", () -> "fake-client-secret");
+        registry.add("app.x-oauth.redirect-uri", () -> "https://example.test/auth/callback");
     }
 
     @Test

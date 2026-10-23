@@ -201,7 +201,7 @@ Count: 33 test methods total in this slice (23 failure cases + 7 happy paths + 1
 | 3 (orphan rows, 5 tables) | `orphanRowsRejected` | `fk_giveaway_entry_giveaway_id`, `fk_giveaway_cm_id`, `fk_account_quota_cm_id`, `fk_refresh_token_cm_id`, `fk_payment_event_cm_id` |
 | 4 (invalid enum) | `invalidEnumValueRejected` | `ck_giveaway_status` |
 | 5 (PRD 3 failure fields) | `failureFieldsWithoutFailedStatusRejected` | `ck_giveaway_failure_fields_only_when_failed` |
-| 6 (duplicate CM email/handle) | `duplicateCommunityManagerEmailOrHandleRejected` | `uq_community_manager_email`, `uq_community_manager_x_handle` |
+| 6 (duplicate CM email/x_user_id) | `duplicateCommunityManagerEmailOrXUserIdRejected` | `uq_community_manager_email`, `uq_community_manager_x_user_id` (updated by slice 3's `V3__drop_x_handle_uniqueness.sql` -- `x_handle` is no longer unique, see `docs/slices/03-auth.md`) |
 | 7 (1:1 cm↔quota) | `secondQuotaRowForSameCmRejected` | `uq_account_quota_cm_id` |
 | 8 (PRD 10 slug before finalization) | `receiptSlugBeforeFinalizationRejected` | `ck_giveaway_receipt_slug_only_when_finalized` |
 | 9 (PRD 10 finalized without slug) | `finalizedGiveawayWithoutSlugRejected` | `ck_giveaway_receipt_slug_only_when_finalized` (same constraint, other direction) |

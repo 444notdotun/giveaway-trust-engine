@@ -62,13 +62,24 @@ final class SchemaTestSupport {
     }
 
     static UUID insertCommunityManager(Connection conn, String email, String handle) throws SQLException {
+        return insertCommunityManager(conn, email, handle, "x-user-" + UUID.randomUUID());
+    }
+
+    /**
+     * Slice 3 (V2__auth.sql): x_user_id is NOT NULL UNIQUE from this migration on -- every
+     * fixture row needs one, even tests that predate the auth slice and only care about
+     * email/x_handle behavior.
+     */
+    static UUID insertCommunityManager(Connection conn, String email, String handle, String xUserId)
+            throws SQLException {
         UUID id = UUID.randomUUID();
         try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO community_manager (id, email, x_handle, created_at) VALUES (?,?,?,?)")) {
+                "INSERT INTO community_manager (id, email, x_handle, x_user_id, created_at) VALUES (?,?,?,?,?)")) {
             ps.setObject(1, id);
             ps.setString(2, email);
             ps.setString(3, handle);
-            ps.setTimestamp(4, Timestamp.from(FIXED_NOW));
+            ps.setString(4, xUserId);
+            ps.setTimestamp(5, Timestamp.from(FIXED_NOW));
             ps.executeUpdate();
         }
         return id;
@@ -207,14 +218,31 @@ final class SchemaTestSupport {
 
     static UUID insertRefreshToken(Connection conn, UUID cmId, UUID familyId, boolean used, Instant expiresAt)
             throws SQLException {
+        try {
+            byte[] hash = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(UUID.randomUUID().toString().getBytes());
+            return insertRefreshToken(conn, cmId, familyId, used, expiresAt, hash);
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException(impossible);
+        }
+    }
+
+    /**
+     * Slice 3 (V2__auth.sql): token_hash is NOT NULL from this migration on -- the SHA-256 of a
+     * freshly generated secret (Section 2), never the secret itself.
+     */
+    static UUID insertRefreshToken(Connection conn, UUID cmId, UUID familyId, boolean used, Instant expiresAt,
+                                    byte[] tokenHash) throws SQLException {
         UUID tokenId = UUID.randomUUID();
         try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at) VALUES (?,?,?,?,?)")) {
+                "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
+                        + "VALUES (?,?,?,?,?,?)")) {
             ps.setObject(1, tokenId);
             ps.setObject(2, familyId);
             ps.setObject(3, cmId);
             ps.setBoolean(4, used);
             ps.setTimestamp(5, Timestamp.from(expiresAt));
+            ps.setBytes(6, tokenHash);
             ps.executeUpdate();
         }
         return tokenId;

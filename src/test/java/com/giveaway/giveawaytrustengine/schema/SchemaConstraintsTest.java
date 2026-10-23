@@ -18,6 +18,7 @@ import java.util.UUID;
 import static com.giveaway.giveawaytrustengine.schema.SchemaTestSupport.*;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
@@ -138,10 +139,10 @@ class SchemaConstraintsTest {
         });
     }
 
-    // ---- Failure case 6: unique community_manager email / x_handle -------------------------
+    // ---- Failure case 6: unique community_manager email / x_user_id ------------------------
     @Test
-    @DisplayName("case 6: duplicate community_manager email and x_handle each rejected")
-    void duplicateCommunityManagerEmailOrHandleRejected() throws SQLException {
+    @DisplayName("case 6: duplicate community_manager email and x_user_id each rejected")
+    void duplicateCommunityManagerEmailOrXUserIdRejected() throws SQLException {
         String sharedEmail = "dup-" + UUID.randomUUID() + "@example.com";
         String firstHandle = "@cm_" + UUID.randomUUID().toString().substring(0, 8);
         insertCommunityManager(conn, sharedEmail, firstHandle);
@@ -149,11 +150,32 @@ class SchemaConstraintsTest {
         assertConstraintViolation("23505", "uq_community_manager_email", () ->
                 insertCommunityManager(conn, sharedEmail, "@cm_" + UUID.randomUUID().toString().substring(0, 8)));
 
+        String sharedXUserId = "x-user-" + UUID.randomUUID();
+        insertCommunityManager(conn, "owner-" + UUID.randomUUID() + "@example.com",
+                "@cm_" + UUID.randomUUID().toString().substring(0, 8), sharedXUserId);
+
+        assertConstraintViolation("23505", "uq_community_manager_x_user_id", () ->
+                insertCommunityManager(conn, "other-" + UUID.randomUUID() + "@example.com",
+                        "@cm_" + UUID.randomUUID().toString().substring(0, 8), sharedXUserId));
+    }
+
+    // ---- Failure case 6a (V3 migration): x_handle is explicitly NOT unique anymore ----------
+    // V1 made x_handle UNIQUE; V2 added x_user_id as the real, immutable identity key (X allows
+    // handle changes); V3 (chunk 4 fix) drops x_handle's own UNIQUE constraint because it is no
+    // longer an identity column -- this slice's own OAuth upsert (INSERT ... ON CONFLICT
+    // (x_user_id) DO UPDATE SET x_handle = ...) refreshes it on every login, and a second,
+    // redundant UNIQUE constraint on that same refreshed value broke the upsert under a race
+    // (OAuthLoginFlowTest#concurrentFirstTimeLoginsForSameXUserCreateExactlyOneRow). Two
+    // different x_user_ids sharing the same x_handle value must now succeed at the DB level.
+    @Test
+    @DisplayName("case 6a (V3): x_handle is no longer unique -- two different x_user_ids may share one")
+    void xHandleIsNoLongerUnique() throws SQLException {
         String sharedHandle = "@cm_" + UUID.randomUUID().toString().substring(0, 8);
         insertCommunityManager(conn, "owner-" + UUID.randomUUID() + "@example.com", sharedHandle);
 
-        assertConstraintViolation("23505", "uq_community_manager_x_handle", () ->
-                insertCommunityManager(conn, "other-" + UUID.randomUUID() + "@example.com", sharedHandle));
+        UUID secondId = insertCommunityManager(
+                conn, "other-" + UUID.randomUUID() + "@example.com", sharedHandle);
+        assertNotNull(secondId);
     }
 
     // ---- Failure case 7: Section 3, 1:1 cm <-> account_quota --------------------------------

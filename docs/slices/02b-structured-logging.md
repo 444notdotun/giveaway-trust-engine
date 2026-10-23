@@ -104,3 +104,21 @@ The existing slice 2a pipeline (merge to `main` → `verify` → `image` build/p
 ## Tests summary
 
 Seven failure tests (Section 5, including the two new real-application JSON-parsing tests and the query-string-secret test) plus: a binding/format test confirming `logging.structured.format.console=ecs` actually produces parseable JSON for a sample log line; re-running the full existing `StartupGuardTest`/`AppPropertiesBindingTest` suite unchanged to confirm no regression (Section 3); a happy-path test confirming a request with no `Rndr-Id` header gets a server-generated UUID that's consistent between the MDC value used during the request and the response header value; a happy-path test confirming a *valid* inbound `Rndr-Id` header (passes length+charset checks) is preserved as-is in both the MDC and the response header, not needlessly replaced; a happy-path test confirming the access-log line itself (Section 4) contains method, path, status, and duration for an ordinary successful request.
+
+## Actual results — slice 2b is done, merged, and accepted on staging
+
+**Proven, not assumed:**
+- `logging.structured.format.console=ecs` is the real default in `application.properties` — confirmed by booting the real application with no override and parsing captured stdout with an actual JSON parser (`defaultProfileWithNoOverrideStillProducesJson`), not just by the explicit-override test used for the other integration tests.
+- `RequestIdFilter` (`@Order(Ordered.HIGHEST_PRECEDENCE)`) puts a sanitized `requestId` in the MDC for the whole request, clears it in a `finally` block on both the normal-completion and exception paths (both asserted directly, and both independently confirmed red under the "delete `MDC.remove`" mutation), and echoes it as the `Rndr-Id` response header.
+- Inbound `Rndr-Id` sanitization (length cap 64, charset `[A-Za-z0-9-]`) holds under all five targeted mutations (delete `MDC.remove`, allow `\n` in the charset, remove the length cap, drop the response header, log the query string) — each one independently confirmed to turn the right test(s) red, then reverted.
+- A rejected header is never silently swallowed: one WARN line (reason + length, never the raw value) plus a Micrometer counter (`giveaway.requestid.header.rejected`, tagged by reason) fire on rejection — added during review against CLAUDE.md's observability rule, not in the original plan.
+- The access-log line never reads the query string (`verify(request, never()).getQueryString()`), so a secret passed there can never reach a log line through this filter.
+- `StartupGuardTest`'s 28 existing assertions pass unchanged under `ecs` format, as predicted in Section 3 — not touched.
+- A plain-text `application-local-dev.properties` profile exists for local development (`logging.structured.format.console=` blank) without changing the production default, added as a follow-up after the first review round.
+- Security-reviewer's CRITICAL REVIEW pass on the sanitization path (Section 2) found no confirmed vulnerabilities: CRLF/log-injection, header-name case-sensitivity, multiple-header, Unicode-confusable, and ReDoS angles were each checked and closed.
+- Deployed via the existing slice 2a CI pipeline with no new deploy mechanism; merged to `main` and accepted on staging.
+
+**Still open, not yet done:**
+- Section 8's acceptance criterion as originally written ("Adedotun reads one real JSON log line from Render's actual log stream") — accepted on staging per the user, but not independently re-verified in this doc from a captured Render log-stream excerpt.
+- `giveawayId` MDC key — still correctly deferred to slice 5, as planned.
+- Slice 5's MDC-thread-propagation gap (documented in Section 2, not built) — remains open until slice 5 actually introduces async work.

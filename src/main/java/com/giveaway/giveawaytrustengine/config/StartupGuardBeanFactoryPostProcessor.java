@@ -87,6 +87,36 @@ public class StartupGuardBeanFactoryPostProcessor implements BeanFactoryPostProc
             throw fail(env + " must not run with Bachs in " + mode + " mode");
         }
 
+        // Chunk 4 review, item 3: same isUnset rule, extended to the OAuth/Redis secrets this
+        // slice added. Required in every environment -- these are never meaningfully optional.
+        String xOauthClientId = binder.bind("app.x-oauth.client-id", String.class).orElse(null);
+        if (isUnset(xOauthClientId)) {
+            throw fail("app.x-oauth.client-id is required");
+        }
+        String xOauthClientSecret = binder.bind("app.x-oauth.client-secret", String.class).orElse(null);
+        if (isUnset(xOauthClientSecret)) {
+            throw fail("app.x-oauth.client-secret is required");
+        }
+        String xOauthRedirectUri = binder.bind("app.x-oauth.redirect-uri", String.class).orElse(null);
+        if (isUnset(xOauthRedirectUri)) {
+            throw fail("app.x-oauth.redirect-uri is required");
+        }
+        String redisPassword = binder.bind("spring.data.redis.password", String.class).orElse(null);
+        if (isUnset(redisPassword)) {
+            throw fail("spring.data.redis.password is required");
+        }
+
+        // Chunk 4 review, item 3: STAGING and PRODUCTION additionally require Redis TLS, checked
+        // as an EXACT string match against "true" -- never trimmed, never case-folded. Upstash
+        // (staging/production's real Redis) mandates TLS; DEV's local, unauthenticated Redis
+        // container does not need it, so this check does not apply there.
+        if (env == Environment.STAGING || env == Environment.PRODUCTION) {
+            String redisTlsEnabled = binder.bind("spring.data.redis.ssl.enabled", String.class).orElse(null);
+            if (!"true".equals(redisTlsEnabled)) {
+                throw fail("spring.data.redis.ssl.enabled must be exactly \"true\" in " + env);
+            }
+        }
+
         log.info("startup guard passed: environment={} bachsMode={}", env, mode);
     }
 
