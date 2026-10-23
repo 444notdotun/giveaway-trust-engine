@@ -83,6 +83,16 @@ class RefreshEndpointTest {
                         "--spring.datasource.username=" + POSTGRES.getUsername(),
                         "--spring.datasource.password=" + POSTGRES.getPassword(),
                         "--spring.datasource.hikari.connection-init-sql=SET statement_timeout=3000",
+                        // Item 1 (final round): explicit, generous pool size so the lock-wait
+                        // test below can never be masked by pool exhaustion -- this one request
+                        // only ever needs one connection at a time (selectRow's is returned
+                        // before atomicallyConsumeAndRotate borrows its own), but this removes
+                        // any doubt. Verified directly (see HikariConnectionInitSqlStatementTimeoutTest's
+                        // class comment): with connection-init-sql removed from BOTH this
+                        // override and application.properties's own default, this test's
+                        // dbFailureDuringRefreshReturns503 genuinely hangs and fails its own
+                        // 15s @Timeout -- it does not pass for the wrong reason.
+                        "--spring.datasource.hikari.maximum-pool-size=20",
                         "--spring.data.redis.host=" + REDIS.getHost(),
                         "--spring.data.redis.port=" + REDIS.getMappedPort(6379),
                         "--spring.data.redis.password=" + REDIS_PASSWORD,
