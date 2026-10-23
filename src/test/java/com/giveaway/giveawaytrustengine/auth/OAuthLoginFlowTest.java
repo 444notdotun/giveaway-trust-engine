@@ -1044,12 +1044,12 @@ class OAuthLoginFlowTest {
         }
     }
 
-    // New RED test (e) -- plan doc Section 0 / Section 4: oauth:state:{state} must have a TTL,
-    // greater than 0 and no more than the configured 10-minute ceiling. FAILS TODAY: nothing is
-    // ever written to Redis by the stub, so there is no key to check a TTL on at all (ttl()
-    // returns a sentinel "key does not exist" value, not a real positive TTL).
+    // Chunk 4 review, item 5: the plan doc states the OAuth state TTL is exactly 5 minutes
+    // (corrected from an earlier, stale "10 minutes" in the doc that never matched
+    // AuthBeansConfig's real Duration.ofMinutes(5)) -- this test now asserts the exact value,
+    // not just an upper ceiling that would pass regardless of which of the two was ever right.
     @Test
-    void oauthStateKeyHasATtlWithinTheTenMinuteCeiling() throws Exception {
+    void oauthStateKeyHasExactlyFiveMinuteTtl() throws Exception {
         HttpResponse<Void> loginResponse = startLogin();
         String location = loginResponse.headers().firstValue("Location").orElseThrow();
         String state = queryParam(location, "state");
@@ -1058,12 +1058,12 @@ class OAuthLoginFlowTest {
         Long ttlSeconds = ttlOf("oauth:state:" + state);
 
         assertThat(ttlSeconds)
-                .as("oauth:state:{state} must exist with a real TTL (a Lettuce ttl() of -2 means "
-                        + "the key does not exist at all, -1 means it exists with no expiry -- "
-                        + "either is a failure here)")
+                .as("oauth:state:{state} must exist with a TTL of EXACTLY 5 minutes (a Lettuce "
+                        + "ttl() of -2 means the key does not exist at all, -1 means it exists "
+                        + "with no expiry -- either is a failure here, and so is any other "
+                        + "duration, per the plan doc's now-corrected '5 minutes' statement)")
                 .isNotNull()
-                .isGreaterThan(0L)
-                .isLessThanOrEqualTo(Duration.ofMinutes(10).toSeconds());
+                .isEqualTo(Duration.ofMinutes(5).toSeconds());
     }
 
     // Chunk 4 review, item 1 (login CSRF): /auth/login must set a browser-bound anti-CSRF
