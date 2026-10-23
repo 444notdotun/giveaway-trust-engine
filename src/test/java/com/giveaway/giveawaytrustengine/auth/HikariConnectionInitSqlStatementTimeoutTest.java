@@ -31,12 +31,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * "mutation" looked caught, but the thing doing the catching was the production default, not
  * anything this specific test asserted.
  *
- * <p>This test proves the mechanism directly instead: build a small Hikari pool with {@code
- * connectionInitSql} set, size it at more than one connection, borrow more connections than the
- * pool size (forcing it to actually create and recycle multiple physical connections, not just
- * repeatedly hand back the same one), and assert {@code SHOW statement_timeout} comes back
- * {@code "5s"} on every single one. No lock, no race, no timing window -- a deterministic,
- * immediate check of the one thing in question.
+ * <p>This test proves the mechanism directly instead: build a small Hikari pool ({@code
+ * minimumIdle == maximumPoolSize}, so every connection in it is opened eagerly at pool startup,
+ * not lazily on first borrow) with {@code connectionInitSql} set, borrow each of its connections
+ * in turn (repeated several times over, well past the pool's own size, to sample every one of
+ * them rather than relying on borrowing exactly once), and assert {@code SHOW statement_timeout}
+ * comes back {@code "5s"} on every single one. No lock, no race, no timing window -- a
+ * deterministic, immediate check of the one thing in question: that Hikari genuinely runs {@code
+ * connectionInitSql} against each physical connection it creates, not just the first.
  */
 @Testcontainers
 class HikariConnectionInitSqlStatementTimeoutTest {
@@ -58,9 +60,9 @@ class HikariConnectionInitSqlStatementTimeoutTest {
 
     /**
      * {@code minimumIdle == maximumPoolSize} forces Hikari to eagerly open every connection in
-     * the pool up front, rather than lazily creating one on first borrow -- so "borrow more times
-     * than the pool size" genuinely exercises more than one distinct physical connection, not
-     * the same one handed back repeatedly.
+     * the pool up front, rather than lazily creating one on first borrow -- so all {@code
+     * poolSize} physical connections exist (and have had {@code connectionInitSql} run against
+     * them) before the first {@code getConnection()} call below, not just the first one borrowed.
      */
     private static HikariDataSource buildPool(String connectionInitSql, int poolSize) {
         HikariConfig config = new HikariConfig();
@@ -84,13 +86,14 @@ class HikariConnectionInitSqlStatementTimeoutTest {
         }
     }
 
-    // The real proof: every connection the pool hands out -- including ones beyond the initial
-    // minimumIdle batch, forcing Hikari to recycle -- carries the statement_timeout the
-    // connection-init-sql configured. Matches application.properties's real value (5000ms -> "5s").
+    // The real proof: every one of the pool's eagerly-created physical connections carries the
+    // statement_timeout connection-init-sql configured -- borrowed well more times than the pool
+    // size (returning each one between borrows) to sample all of them, not just the first.
+    // Matches application.properties's real value (5000ms -> "5s").
     @Test
     void everyPooledConnectionHasStatementTimeoutFromConnectionInitSql() throws Exception {
         try (HikariDataSource pool = buildPool("SET statement_timeout=5000", 3)) {
-            for (int i = 0; i < 8; i++) { // more than the pool size: forces connection reuse/recycling
+            for (int i = 0; i < 8; i++) { // well past the pool size: samples every connection in it
                 try (Connection conn = pool.getConnection()) {
                     assertThat(showStatementTimeout(conn))
                             .as("connection #%d borrowed from the pool must carry the configured statement_timeout", i)
