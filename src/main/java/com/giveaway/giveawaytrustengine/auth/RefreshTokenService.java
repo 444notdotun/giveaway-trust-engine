@@ -54,6 +54,15 @@ public class RefreshTokenService {
     private static final Duration REFRESH_TOKEN_LIFETIME = Duration.ofDays(7);
     private static final int SECRET_LENGTH_BYTES = 32;
 
+    /**
+     * The ONE message every {@link ReuseDetectedException} this class throws carries -- a
+     * malformed cookie, an unknown token_id, a wrong secret, and genuine reuse are all
+     * byte-identical from the outside (item 4). Never add a case-specific message here; a
+     * second literal string would immediately reopen the distinguishability this exists to
+     * close.
+     */
+    static final String GENERIC_REJECTION_MESSAGE = "refresh token invalid";
+
     private final DataSource dataSource;
     private final Clock clock;
     private final RevocationChecker revocationChecker;
@@ -76,7 +85,7 @@ public class RefreshTokenService {
         // here is harmless, never load-bearing for correctness.
         RowSnapshot row = selectRow(parsed.tokenId());
         if (row == null || !secretMatches(parsed.secret(), row.tokenHash())) {
-            throw new ReuseDetectedException("refresh token invalid");
+            throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         if (clock.instant().isAfter(row.expiresAt())) {
             throw new ExpiredRefreshTokenException("refresh token expired");
@@ -85,7 +94,10 @@ public class RefreshTokenService {
         AtomicConsumeResult consumed = atomicallyConsumeAndRotate(parsed.tokenId(), row.familyId(), row.cmId());
         if (!consumed.won()) {
             revokeFamilySwallowingRedisFailure(row.familyId());
-            throw new ReuseDetectedException("refresh token already used");
+            // Byte-identical to the "unknown token"/"wrong secret" rejection below -- never a
+            // distinguishable message, so a caller can't tell reuse from an unknown token from
+            // the response body alone (item 4).
+            throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
 
         String newAccessToken = jwtService.issueAccessToken(row.cmId(), row.familyId());
@@ -218,7 +230,7 @@ public class RefreshTokenService {
     private static ParsedCookie parseCookie(String cookieValue) {
         int dot = cookieValue.indexOf('.');
         if (dot < 0) {
-            throw new ReuseDetectedException("malformed refresh token");
+            throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         UUID tokenId;
         try {
@@ -227,14 +239,14 @@ public class RefreshTokenService {
             tokenId = UUID.fromString(tokenIdString);
         }
         catch (RuntimeException malformed) {
-            throw new ReuseDetectedException("malformed refresh token");
+            throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         byte[] secret;
         try {
             secret = Base64.getUrlDecoder().decode(cookieValue.substring(dot + 1));
         }
         catch (IllegalArgumentException malformed) {
-            throw new ReuseDetectedException("malformed refresh token");
+            throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         return new ParsedCookie(tokenId, secret);
     }

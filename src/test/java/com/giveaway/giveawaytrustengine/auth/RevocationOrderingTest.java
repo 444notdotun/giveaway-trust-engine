@@ -215,7 +215,7 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15));
     }
 
     private RevocationChecker checkerWithWorkingRedisAndBrokenDb() {
@@ -225,7 +225,7 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(brokenDataSource(), factory, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        return new RevocationChecker(brokenDataSource(), factory, CLOCK, Duration.ofMinutes(15));
     }
 
     private RevocationChecker checkerWithUnreachableRedis() throws Exception {
@@ -239,8 +239,7 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15),
-                Duration.ofHours(24), meterRegistry);
+        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15), meterRegistry);
     }
 
     /** Seeds two fresh, never-used refresh_token rows for the given family. */

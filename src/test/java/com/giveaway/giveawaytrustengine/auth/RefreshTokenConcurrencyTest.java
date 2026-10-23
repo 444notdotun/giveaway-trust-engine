@@ -195,7 +195,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertFreshToken(tokenId, familyId, false);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         CountDownLatch startLatch = new CountDownLatch(2);
@@ -242,7 +242,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenAId = UUID.randomUUID();
         String tokenACookie = insertFreshToken(tokenAId, familyId, false);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         RefreshResult rotated = service.refresh(tokenACookie); // A -> B
@@ -276,7 +276,7 @@ class RefreshTokenConcurrencyTest {
         String tokenACookie = insertFreshToken(tokenAId, familyId, false);
         String tokenCCookie = insertFreshToken(tokenCId, familyId, false); // sibling, never touched
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         service.refresh(tokenACookie); // rotates A -> new token, family now partially used
@@ -296,7 +296,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertFreshToken(tokenId, familyId, false);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         RefreshResult result = service.refresh(cookieValue);
@@ -325,7 +325,7 @@ class RefreshTokenConcurrencyTest {
     void refreshTokensAreStoredHashedNeverRawInTokenHashColumn() throws Exception {
         UUID familyId = UUID.randomUUID();
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         RefreshResult result = service.issueInitialRefreshToken(cmId, familyId);
@@ -365,7 +365,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertExpiredToken(tokenId, familyId);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         org.junit.jupiter.api.Assertions.assertThrows(ExpiredRefreshTokenException.class,
@@ -396,5 +396,101 @@ class RefreshTokenConcurrencyTest {
         }
         return Base64.getUrlEncoder().withoutPadding().encodeToString(tokenId.toString().getBytes())
                 + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+    }
+
+    // Item 3: several threads concurrently presenting the SAME already-used (stale) token --
+    // not the "first race to consume it" case above, but everyone piling onto a token that was
+    // already rotated out. Proves no deadlock/timeout (a bounded await actually completes), every
+    // thread finishes, the family ends up fully revoked, and every thread sees the identical
+    // generic error -- not a mix of exception types or messages depending on arrival order.
+    @Test
+    void severalThreadsConcurrentlyReusingSameStaleTokenAllFinishWithTheSameGenericError() throws Exception {
+        UUID familyId = UUID.randomUUID();
+        UUID tokenAId = UUID.randomUUID();
+        String tokenACookie = insertFreshToken(tokenAId, familyId, false);
+
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
+
+        // Rotate once first, so token A is now genuinely stale (used = true) before the
+        // concurrent pile-on below -- this is testing the "many latecomers hit an already-used
+        // token" shape, distinct from "two threads race to be first".
+        service.refresh(tokenACookie);
+
+        int threadCount = 5;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(threadCount);
+        CountDownLatch doneLatch = new CountDownLatch(threadCount);
+        java.util.Queue<Throwable> thrown = new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+        for (int i = 0; i < threadCount; i++) {
+            pool.submit(() -> {
+                try {
+                    startLatch.countDown();
+                    startLatch.await();
+                    service.refresh(tokenACookie);
+                }
+                catch (Throwable t) {
+                    thrown.add(t);
+                }
+                finally {
+                    doneLatch.countDown();
+                }
+            });
+        }
+
+        boolean finishedInTime = doneLatch.await(10, java.util.concurrent.TimeUnit.SECONDS);
+        pool.shutdownNow();
+
+        assertThat(finishedInTime)
+                .as("bounded wait: all threads must finish within 10s, proving no deadlock/timeout")
+                .isTrue();
+        assertThat(thrown).as("every thread must have thrown (the token was already stale)").hasSize(threadCount);
+        assertThat(thrown)
+                .as("every thread gets the SAME exception type")
+                .allMatch(t -> t instanceof ReuseDetectedException);
+        assertThat(thrown.stream().map(Throwable::getMessage).distinct().count())
+                .as("every thread gets the SAME generic error message -- not a mix")
+                .isEqualTo(1);
+
+        assertThat(countUsedInFamily(familyId))
+                .as("the family ends up fully revoked (both the original and its one rotation)")
+                .isEqualTo(countTotalInFamily(familyId))
+                .isGreaterThan(0);
+    }
+
+    // Item 4: a reuse rejection and an unknown-token rejection must be byte-identical -- not just
+    // "the same exception class" but the literal same message, asserted directly, not assumed
+    // from reading the source.
+    @Test
+    void reuseRejectionIsByteIdenticalToUnknownTokenRejection() throws Exception {
+        UUID familyId = UUID.randomUUID();
+        UUID tokenAId = UUID.randomUUID();
+        String tokenACookie = insertFreshToken(tokenAId, familyId, false);
+
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
+
+        service.refresh(tokenACookie); // A is now stale
+
+        Throwable reuseRejection = org.assertj.core.api.Assertions.catchThrowable(() -> service.refresh(tokenACookie));
+
+        // An entirely unknown token_id -- never inserted at all.
+        String unknownCookie = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(UUID.randomUUID().toString().getBytes())
+                + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
+        Throwable unknownRejection = org.assertj.core.api.Assertions.catchThrowable(() -> service.refresh(unknownCookie));
+
+        assertThat(reuseRejection).isNotNull();
+        assertThat(unknownRejection).isNotNull();
+        assertThat(reuseRejection.getClass()).isEqualTo(unknownRejection.getClass());
+        assertThat(reuseRejection.getMessage())
+                .as("the response body (whatever a future controller serializes from this "
+                        + "message) must be byte-identical between reuse and unknown-token")
+                .isEqualTo(unknownRejection.getMessage());
+
+        // Byte-identical, literally -- not just String.equals (which could mask encoding quirks).
+        assertThat(reuseRejection.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                .isEqualTo(unknownRejection.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 }

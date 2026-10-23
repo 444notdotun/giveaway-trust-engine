@@ -38,11 +38,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Slice 3 (Auth) -- CRITICAL REVIEW scope (revocation ordering).
  * Plan doc: docs/slices/03-auth.md, Section 1 (TLS/auth on Redis), Section 4
- * (RevocationChecker / RevocationCheckUnavailableException), Section 4a (revocation-epoch),
- * Section 5 (failure tests 7, 10, 11, 12, 21).
+ * (RevocationChecker / RevocationCheckUnavailableException), Section 5 (failure tests 7, 10,
+ * 11, 12).
  *
- * RED: {@code RevocationChecker} and {@code RevocationCheckUnavailableException} do not exist
- * yet.
+ * The revocation-epoch mechanism (Section 4a) was built, reviewed, and deliberately cut as a
+ * scope reduction -- see docs/slices/03-auth.md, Section 4a, for the accepted risk this leaves
+ * and why it's still bounded by the revoked-key TTL regardless. No epoch-related test remains
+ * in this file.
  *
  * The TLS+auth Redis container mirrors Upstash's mandatory posture (plan doc Section 1) rather
  * than a trivial unauthenticated local instance -- a self-signed cert is generated once per test
@@ -59,9 +61,9 @@ class RevocationCheckerTest {
     static GenericContainer<?> TLS_REDIS;
     static Path certDir;
 
-    // revokeFamily now writes to refresh_token (Section 4, DB-first) -- a real Postgres is
-    // needed here too, same pattern as RevocationOrderingTest. This test class doesn't care
-    // about specific row counts (no rows are seeded for the UUIDs it uses), only that the write
+    // revokeFamily writes to refresh_token (Section 4, DB-first) -- a real Postgres is needed
+    // here too, same pattern as RevocationOrderingTest. This test class doesn't care about
+    // specific row counts (no rows are seeded for the UUIDs it uses), only that the write
     // succeeds against a real, migrated schema.
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(TestImages.POSTGRES)
             .withDatabaseName("revocation_checker_test")
@@ -149,17 +151,7 @@ class RevocationCheckerTest {
         TLS_REDIS.start();
     }
 
-    /**
-     * {@code revocation-epoch} is a single GLOBAL key, shared across every test in this class
-     * (unlike {@code revoked:{familyId}}, which each test already isolates via a fresh random
-     * UUID). Without a reset, one test's manual TTL manipulation (e.g. {@code rawSetTtl}, used to
-     * simulate time passing) or epoch initialization can leak into a LATER test's observations,
-     * silently making it pass or fail for the wrong reason depending on execution order --
-     * caught directly: a full-class mutation run showed {@code epochKeyHasATtlAfterInit} passing
-     * under a mutation that removed all TTL-setting, only because an unrelated, earlier-run
-     * test's leftover manual TTL was still on the key. Flushing before every test removes that
-     * cross-test dependency entirely.
-     */
+    /** Flushes Redis before every test -- simple hygiene so no test's state leaks into another's. */
     @BeforeEach
     void resetRedisState() {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
@@ -220,16 +212,6 @@ class RevocationCheckerTest {
     }
 
     private RevocationChecker checkerWithPassword(String password) {
-        return checkerWithPassword(password, Duration.ofMinutes(15), Duration.ofHours(24));
-    }
-
-    /**
-     * {@code epochWindow} and {@code epochTtl} are both customizable (not just {@code epochTtl}
-     * against a hardcoded 15-minute window) so TTL-refresh tests can use a tiny window+TTL pair
-     * that still satisfies the constructor's own "epochTtl >= 2x epochWindow" validation, instead
-     * of waiting out a real 15-minute access-token-lifetime-sized window in a unit test.
-     */
-    private RevocationChecker checkerWithPassword(String password, Duration epochWindow, Duration epochTtl) {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
                 TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
         config.setPassword(password);
@@ -239,101 +221,7 @@ class RevocationCheckerTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(postgresDataSource(), factory, CLOCK, epochWindow, epochTtl);
-    }
-
-    /** Reads the real TTL (seconds) of a key directly from Redis, bypassing RevocationChecker. */
-    private long rawTtlSeconds(String key) {
-        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
-                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
-        config.setPassword(REDIS_PASSWORD);
-        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
-                .useSsl().disablePeerVerification().and()
-                .commandTimeout(Duration.ofSeconds(2))
-                .build();
-        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
-        factory.afterPropertiesSet();
-        try {
-            Long ttl = factory.getConnection().keyCommands().ttl(key.getBytes());
-            return ttl == null ? -2 : ttl;
-        } finally {
-            factory.destroy();
-        }
-    }
-
-    /** Sets a key's TTL directly via Redis, bypassing RevocationChecker (simulates time passing). */
-    private void rawSetTtl(String key, long seconds) {
-        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
-                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
-        config.setPassword(REDIS_PASSWORD);
-        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
-                .useSsl().disablePeerVerification().and()
-                .commandTimeout(Duration.ofSeconds(2))
-                .build();
-        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
-        factory.afterPropertiesSet();
-        try {
-            factory.getConnection().keyCommands().expire(key.getBytes(), seconds);
-        } finally {
-            factory.destroy();
-        }
-    }
-
-    // Section 4a, item 1(a): the revocation-epoch key must have a TTL, not live forever -- a
-    // key with no TTL at all would violate CLAUDE.md's "every Redis key has a TTL" the same way
-    // an un-TTL'd revoked:{familyId} key would.
-    @Test
-    void epochKeyHasATtlAfterInit() {
-        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD, Duration.ofMinutes(15), Duration.ofHours(24));
-        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // triggers epoch init
-
-        long ttl = rawTtlSeconds("revocation-epoch");
-        assertThat(ttl)
-                .as("revocation-epoch must have a real TTL after being initialized, not live forever")
-                .isGreaterThan(0);
-    }
-
-    // Section 4a, item 1(b): a read refreshes (slides) the TTL -- it must not be left to coast
-    // down to expiry while the system is actively being used. Initialize with a short TTL,
-    // manually wind it down to simulate time passing, then prove a subsequent read pushes it
-    // back up rather than leaving it to keep decaying.
-    @Test
-    void readRefreshesTheEpochTtl() {
-        // A tiny window+TTL pair, not the real 15-minute access-token lifetime -- still
-        // satisfies the constructor's own "epochTtl >= 2x epochWindow" validation (4s >= 2x2s),
-        // without making this test wait out a real 15-minute window.
-        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD, Duration.ofSeconds(2), Duration.ofSeconds(10));
-        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // init, TTL ~10s
-
-        rawSetTtl("revocation-epoch", 2); // simulate most of the window having elapsed
-        assertThat(rawTtlSeconds("revocation-epoch")).isLessThanOrEqualTo(2);
-
-        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // the read to test
-
-        assertThat(rawTtlSeconds("revocation-epoch"))
-                .as("a read must refresh (slide) the TTL back up, not leave it decaying toward "
-                        + "the value we manually wound it down to")
-                .isGreaterThan(2);
-    }
-
-    // Section 4a, item 1(c): refreshing the TTL must not perturb the epoch's own VALUE -- a
-    // token issued after the epoch was established must still read as "not revoked" even after
-    // the key's TTL has been refreshed by an intervening read, proving the refresh only touches
-    // the key's lifetime, never the timestamp it stores.
-    @Test
-    void tokenIssuedAfterEpochStillNotRevokedAfterTtlRefresh() {
-        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD, Duration.ofSeconds(2), Duration.ofSeconds(10));
-        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // establishes epoch ~= FIXED_NOW
-
-        rawSetTtl("revocation-epoch", 2);
-        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // refreshes TTL, same epoch value
-        assertThat(rawTtlSeconds("revocation-epoch")).isGreaterThan(2);
-
-        Instant afterEpoch = FIXED_NOW.plusSeconds(5);
-        assertThat(checker.isFamilyRevoked(UUID.randomUUID(), afterEpoch))
-                .as("a token issued after the epoch must still read as not-revoked even once the "
-                        + "epoch key's TTL has been refreshed by an intervening read")
-                .isFalse();
+        return new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15));
     }
 
     // Failure test 10 (Section 5.10): a connection over TLS with the correct password succeeds
@@ -406,7 +294,7 @@ class RevocationCheckerTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        RevocationChecker checker = new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
+        RevocationChecker checker = new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15));
 
         assertThatThrownBy(() -> checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)))
                 .isInstanceOf(RevocationCheckUnavailableException.class);
@@ -465,60 +353,5 @@ class RevocationCheckerTest {
         assertThat(output.getAll())
                 .as("the full connection string shape (which embeds the password) must never appear")
                 .doesNotContain(fullConnectionStringShape);
-    }
-
-    // Failure test 21 (Section 4a): Redis restart losing the revoked set entirely must not
-    // silently re-accept a revoked access token -- the revocation-epoch mechanism must still
-    // reject a still-unexpired, pre-loss token via 401-shaped rejection (isFamilyRevoked still
-    // returns true), not silently "not revoked" once the direct evidence (the TTL'd key) is gone.
-    @Test
-    void redisDataLossDoesNotSilentlyReacceptRevokedToken() {
-        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD);
-        UUID familyId = UUID.randomUUID();
-        Instant tokenIssuedAt = FIXED_NOW.minusSeconds(30);
-
-        checker.revokeFamily(familyId);
-        assertThat(checker.isFamilyRevoked(familyId, tokenIssuedAt))
-                .as("immediately after revocation, the direct evidence (the TTL'd key) says revoked")
-                .isTrue();
-
-        // Simulate total Redis data loss (operator-triggered flush / eviction / restart losing
-        // all data) -- the specific revoked:{familyId} key, AND the revocation-epoch marker
-        // itself, are both gone.
-        flushAllOn(checker);
-
-        assertThat(checker.isFamilyRevoked(familyId, tokenIssuedAt))
-                .as("even with the direct evidence gone, a token issued before the just-reset "
-                        + "revocation-epoch must still be rejected -- proving the epoch mechanism "
-                        + "catches what the lost key would have caught")
-                .isTrue();
-
-        // A token issued AFTER the new epoch is unaffected -- proving this isn't a blanket
-        // "reject everything" but specifically age-relative-to-epoch.
-        Instant freshTokenIssuedAt = FIXED_NOW.plusSeconds(5);
-        assertThat(checker.isFamilyRevoked(UUID.randomUUID(), freshTokenIssuedAt))
-                .as("a token issued after the new epoch, for an unrelated never-revoked family, "
-                        + "must not be caught by the epoch check")
-                .isFalse();
-    }
-
-    private void flushAllOn(RevocationChecker checker) {
-        // Exercises the real Redis FLUSHALL against the same container the checker is bound to,
-        // via a throwaway connection using the same credentials -- a real, total data loss, not
-        // a mocked "pretend it's empty".
-        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
-                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
-        config.setPassword(REDIS_PASSWORD);
-        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
-                .useSsl().disablePeerVerification().and()
-                .commandTimeout(Duration.ofSeconds(2))
-                .build();
-        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
-        factory.afterPropertiesSet();
-        try {
-            factory.getConnection().serverCommands().flushAll();
-        } finally {
-            factory.destroy();
-        }
     }
 }
