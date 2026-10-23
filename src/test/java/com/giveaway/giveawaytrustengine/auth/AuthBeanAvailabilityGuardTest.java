@@ -265,6 +265,103 @@ class AuthBeanAvailabilityGuardTest {
         }
     }
 
+    // Chunk 4 review (final round), item 3: the exclusion check must be exact and per-dependency,
+    // not a combined substring OR -- excluding ONLY DataSourceAutoConfiguration must not silence
+    // a null OAuthStateService, which depends only on Redis.
+    @Test
+    void oauthStateServiceNullWithOnlyDataSourceExcludedStillFails() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptOauthStateService.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(IllegalStateException.class);
+                    assertThat(root.getMessage()).contains("oauthStateService");
+                });
+    }
+
+    @Test
+    void oauthStateServiceNullWithRedisExcludedBootsCleanly() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptOauthStateService.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    // Excluding ONLY DataRedisAutoConfiguration must not silence a null
+    // CommunityManagerRepository, which depends only on the DataSource.
+    @Test
+    void communityManagerRepositoryNullWithOnlyRedisExcludedStillFails() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(IllegalStateException.class);
+                    assertThat(root.getMessage()).contains("communityManagerRepository");
+                });
+    }
+
+    @Test
+    void communityManagerRepositoryNullWithDataSourceExcludedBootsCleanly() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Test
+    void refreshTokenServiceNullWithDataSourceExcludedBootsCleanly() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptRefreshTokenService.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    // RevocationChecker depends on BOTH DataSource and Redis -- either one excluded alone
+    // already fully explains a null RevocationChecker, so either should silence the guard for
+    // this bean specifically (but not for the other three, which is what the tests above prove).
+    @Test
+    void revocationCheckerNullWithOnlyDataSourceExcludedBootsCleanly() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptRevocationChecker.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Test
+    void revocationCheckerNullWithOnlyRedisExcludedBootsCleanly() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptRevocationChecker.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    // A lookalike class name that merely CONTAINS "DataSourceAutoConfiguration" as a substring
+    // (but is not an exact, comma-separated entry matching it) must not disable the guard --
+    // proving the match is exact-entry, not String.contains(...) against the whole property value.
+    @Test
+    void lookalikeExclusionPropertyDoesNotDisableGuard() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withPropertyValues("spring.autoconfigure.exclude=com.acme.MyDataSourceAutoConfigurationShim")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(IllegalStateException.class);
+                    assertThat(root.getMessage()).contains("communityManagerRepository");
+                });
+    }
+
     @Test
     void allFourPresentBootsCleanly() {
         new ApplicationContextRunner()

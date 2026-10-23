@@ -22,16 +22,25 @@ import org.springframework.stereotype.Component;
  * actually needs the bean. This fails fast instead, at startup, naming exactly which bean never
  * resolved.
  *
- * <p>The two situations are told apart by whether {@code spring.autoconfigure.exclude} names
- * {@code DataSourceAutoConfiguration} or {@code DataRedisAutoConfiguration} -- the same flag the
- * excluded-context tests already set to get a Redis/DB-less boot. If that flag is present, a
- * {@code null} bean is expected and this guard stays quiet; otherwise a {@code null} bean is a
- * startup-time bug.
+ * <p>Chunk 4 review (final round), item 3: the exclusion check is exact and per-dependency, not
+ * a combined substring flag. {@code spring.autoconfigure.exclude} is split on commas and each
+ * entry compared by exact string equality against the two known autoconfiguration class names --
+ * never {@code String.contains(...)} against the whole property value, which would treat a
+ * lookalike class name (e.g. {@code com.acme.MyDataSourceAutoConfigurationShim}) as a real
+ * exclusion. Each bean is checked against only the exclusion that actually explains its own
+ * {@code null}: {@link OAuthStateService} depends only on Redis, {@link CommunityManagerRepository}
+ * and {@link RefreshTokenService} depend only on the DataSource, and {@link RevocationChecker}
+ * depends on both (so either exclusion alone already fully explains a null RevocationChecker).
  */
 @Component
 public class AuthBeanAvailabilityGuard implements SmartInitializingSingleton, EnvironmentAware {
 
     private static final Logger log = LoggerFactory.getLogger(AuthBeanAvailabilityGuard.class);
+
+    private static final String DATASOURCE_AUTOCONFIGURATION_CLASS =
+            "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration";
+    private static final String REDIS_AUTOCONFIGURATION_CLASS =
+            "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration";
 
     private final ObjectProvider<RevocationChecker> revocationChecker;
     private final ObjectProvider<OAuthStateService> oauthStateService;
@@ -56,26 +65,37 @@ public class AuthBeanAvailabilityGuard implements SmartInitializingSingleton, En
 
     @Override
     public void afterSingletonsInstantiated() {
-        if (infrastructureDeliberatelyExcluded()) {
-            return;
+        boolean dataSourceExcluded = isExcluded(DATASOURCE_AUTOCONFIGURATION_CLASS);
+        boolean redisExcluded = isExcluded(REDIS_AUTOCONFIGURATION_CLASS);
+
+        if (!(dataSourceExcluded || redisExcluded)) {
+            requireResolved("revocationChecker", revocationChecker.getIfAvailable());
         }
-        requireResolved("revocationChecker", revocationChecker.getIfAvailable());
-        requireResolved("oauthStateService", oauthStateService.getIfAvailable());
-        requireResolved("communityManagerRepository", communityManagerRepository.getIfAvailable());
-        requireResolved("refreshTokenService", refreshTokenService.getIfAvailable());
+        if (!redisExcluded) {
+            requireResolved("oauthStateService", oauthStateService.getIfAvailable());
+        }
+        if (!dataSourceExcluded) {
+            requireResolved("communityManagerRepository", communityManagerRepository.getIfAvailable());
+            requireResolved("refreshTokenService", refreshTokenService.getIfAvailable());
+        }
     }
 
-    private boolean infrastructureDeliberatelyExcluded() {
+    private boolean isExcluded(String autoConfigurationClassName) {
         String excludes = environment.getProperty("spring.autoconfigure.exclude", "");
-        return excludes.contains("DataRedisAutoConfiguration") || excludes.contains("DataSourceAutoConfiguration");
+        for (String entry : excludes.split(",")) {
+            if (entry.trim().equals(autoConfigurationClassName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void requireResolved(String beanName, Object bean) {
         if (bean == null) {
-            String message = beanName + " resolved to null at startup. Redis/DataSource "
-                    + "autoconfiguration was not excluded, so this bean is expected to be "
-                    + "available; refusing to start rather than risk a NullPointerException on "
-                    + "first use.";
+            String message = beanName + " resolved to null at startup. Its required infrastructure "
+                    + "(Redis and/or the DataSource) was not excluded via spring.autoconfigure.exclude, "
+                    + "so this bean is expected to be available; refusing to start rather than risk a "
+                    + "NullPointerException on first use.";
             log.error("auth bean availability guard refused to start: bean={}", beanName);
             throw new IllegalStateException(message);
         }
