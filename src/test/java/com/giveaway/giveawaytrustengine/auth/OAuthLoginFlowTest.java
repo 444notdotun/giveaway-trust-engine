@@ -247,6 +247,19 @@ class OAuthLoginFlowTest {
         }
     }
 
+    private int countAccountQuotaRowsForXUserId(String xUserId) throws SQLException {
+        try (Connection conn = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT count(*) FROM account_quota aq "
+                             + "JOIN community_manager cm ON cm.id = aq.cm_id "
+                             + "WHERE cm.x_user_id = '" + xUserId + "'")) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+
     private List<String> handlesForXUserId(String xUserId) throws SQLException {
         List<String> handles = new ArrayList<>();
         try (Connection conn = DriverManager.getConnection(
@@ -414,12 +427,14 @@ class OAuthLoginFlowTest {
         CountDownLatch startLatch = new CountDownLatch(2);
         CountDownLatch doneLatch = new CountDownLatch(2);
         AtomicReference<Throwable> unexpected = new AtomicReference<>();
+        AtomicReference<Integer> status1 = new AtomicReference<>();
+        AtomicReference<Integer> status2 = new AtomicReference<>();
 
         Runnable call1 = () -> {
             try {
                 startLatch.countDown();
                 startLatch.await();
-                callback("code=" + code1 + "&state=" + state1);
+                status1.set(callback("code=" + code1 + "&state=" + state1).statusCode());
             } catch (Throwable t) {
                 unexpected.set(t);
             } finally {
@@ -430,7 +445,7 @@ class OAuthLoginFlowTest {
             try {
                 startLatch.countDown();
                 startLatch.await();
-                callback("code=" + code2 + "&state=" + state2);
+                status2.set(callback("code=" + code2 + "&state=" + state2).statusCode());
             } catch (Throwable t) {
                 unexpected.set(t);
             } finally {
@@ -446,6 +461,19 @@ class OAuthLoginFlowTest {
         assertThat(countCommunityManagersByXUserId(sharedXUserId))
                 .as("exactly one community_manager row for this x_user_id, not two")
                 .isEqualTo(1);
+        // The unique constraint on x_user_id alone already forces the row count above to 1 even
+        // under a select-then-insert implementation -- it just makes the LOSING request blow up
+        // with a constraint-violation exception (500) instead of resolving gracefully via
+        // ON CONFLICT. Both calls succeeding cleanly is the property that actually distinguishes
+        // a real upsert from a race-prone select-then-insert.
+        assertThat(status1.get())
+                .as("neither concurrent login may fail with an unhandled exception (select-then-insert "
+                        + "would surface the loser's unique-constraint violation as a 500)")
+                .isBetween(200, 299);
+        assertThat(status2.get())
+                .as("neither concurrent login may fail with an unhandled exception (select-then-insert "
+                        + "would surface the loser's unique-constraint violation as a 500)")
+                .isBetween(200, 299);
     }
 
     // Failure test 19 (Section 5.19): a handle rename updates the SAME account, not a new one.
@@ -548,6 +576,56 @@ class OAuthLoginFlowTest {
             }
         }
         return false;
+    }
+
+    // New RED test (f): the token-exchange request this app actually sends to X must include the
+    // PKCE code_verifier it stored for this state -- not just "some verifier the stub happens to
+    // accept." Isolates the mutation "verifier left out of the token exchange" from "wrong
+    // verifier sent" (pkceVerifierMismatchFailsTokenExchange, above, can't tell those two apart by
+    // itself: both end up hitting the catch-all 400 stub there). FAILS TODAY: the stub never
+    // calls X at all, so no request to assert against exists yet.
+    @Test
+    void tokenExchangeRequestIncludesTheStoredPkceVerifier() throws Exception {
+        String xUserId = "x-user-" + UUID.randomUUID();
+        HttpResponse<Void> loginResponse = startLogin();
+        String location = loginResponse.headers().firstValue("Location").orElseThrow();
+        String state = queryParam(location, "state");
+        String verifier = readStoredVerifier(state);
+        assertThat(verifier).isNotNull();
+
+        String code = "code-" + UUID.randomUUID();
+        String accessToken = "access-" + UUID.randomUUID();
+        stubTokenExchangeSuccess(code, accessToken);
+        stubUserLookupSuccess(accessToken, xUserId, "verifier_check_handle");
+
+        HttpResponse<String> response = callback("code=" + code + "&state=" + state);
+        assertThat(response.statusCode()).isBetween(200, 299);
+
+        wireMock.verify(postRequestedFor(urlEqualTo("/2/oauth2/token"))
+                .withRequestBody(containing("code_verifier=" + verifier)));
+    }
+
+    // New RED test (g) -- plan doc Section 0 / PRD Section 3 ("CommunityManager 1 owns 1
+    // AccountQuota"): a brand-new CM created by this login flow gets exactly one account_quota
+    // row, not zero. FAILS TODAY: the stub never creates a community_manager row at all, so
+    // there is nothing for an account_quota row to even reference.
+    @Test
+    void newCommunityManagerGetsExactlyOneAccountQuotaRow() throws Exception {
+        String xUserId = "x-user-" + UUID.randomUUID();
+        HttpResponse<Void> loginResponse = startLogin();
+        String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
+        String code = "code-" + UUID.randomUUID();
+        String accessToken = "access-" + UUID.randomUUID();
+        stubTokenExchangeSuccess(code, accessToken);
+        stubUserLookupSuccess(accessToken, xUserId, "quota_check_handle");
+
+        HttpResponse<String> response = callback("code=" + code + "&state=" + state);
+        assertThat(response.statusCode()).isBetween(200, 299);
+
+        assertThat(countAccountQuotaRowsForXUserId(xUserId))
+                .as("a brand-new community_manager row must get exactly one account_quota row, "
+                        + "created in the same transaction (PRD: CommunityManager 1 owns 1 AccountQuota)")
+                .isEqualTo(1);
     }
 
     // Happy path (Tests summary): OAuth login against mocked X endpoints -- callback upserts

@@ -1,6 +1,7 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.config.JwtProperties;
+import com.giveaway.giveawaytrustengine.config.XOAuthProperties;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
@@ -51,5 +52,46 @@ public class AuthBeansConfig {
             return null;
         }
         return new RevocationChecker(source, factory, clock, Duration.ofMinutes(15), meterRegistry);
+    }
+
+    /**
+     * Returns {@code null} in contexts without Redis autoconfiguration (same {@code
+     * ObjectProvider}-resolved-lazily reasoning as {@link #revocationChecker} above) --
+     * {@link OAuthLoginController} takes this via {@code ObjectProvider} for the same reason
+     * {@link ResolvePingController} takes {@link RevocationChecker} that way.
+     */
+    @Bean
+    public OAuthStateService oauthStateService(ObjectProvider<LettuceConnectionFactory> connectionFactory) {
+        LettuceConnectionFactory factory = connectionFactory.getIfAvailable();
+        if (factory == null) {
+            return null;
+        }
+        return new OAuthStateService(factory, Duration.ofMinutes(5));
+    }
+
+    @Bean
+    public XOAuthClient xOAuthClient(XOAuthProperties oAuthProperties) {
+        return new XOAuthClient(oAuthProperties);
+    }
+
+    /** Returns {@code null} in contexts without a real {@code DataSource} -- same reasoning as above. */
+    @Bean
+    public CommunityManagerRepository communityManagerRepository(ObjectProvider<DataSource> dataSource, Clock clock) {
+        DataSource source = dataSource.getIfAvailable();
+        if (source == null) {
+            return null;
+        }
+        return new CommunityManagerRepository(source, clock);
+    }
+
+    /** Returns {@code null} in contexts without a real {@code DataSource} -- same reasoning as above. */
+    @Bean
+    public RefreshTokenService refreshTokenService(ObjectProvider<DataSource> dataSource, Clock clock,
+            ObjectProvider<RevocationChecker> revocationChecker, JwtService jwtService) {
+        DataSource source = dataSource.getIfAvailable();
+        if (source == null) {
+            return null;
+        }
+        return new RefreshTokenService(source, clock, revocationChecker.getIfAvailable(), jwtService);
     }
 }

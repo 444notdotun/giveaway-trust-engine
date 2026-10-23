@@ -1,6 +1,7 @@
 package com.giveaway.giveawaytrustengine;
 
 import com.giveaway.giveawaytrustengine.config.AppProperties;
+import com.giveaway.giveawaytrustengine.config.CookieProperties;
 import com.giveaway.giveawaytrustengine.config.JwtProperties;
 import com.giveaway.giveawaytrustengine.config.XOAuthProperties;
 import org.springframework.boot.SpringApplication;
@@ -8,7 +9,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 @SpringBootApplication
-@EnableConfigurationProperties({AppProperties.class, XOAuthProperties.class, JwtProperties.class})
+@EnableConfigurationProperties({AppProperties.class, XOAuthProperties.class, JwtProperties.class, CookieProperties.class})
 public class GiveawayTrustEngineApplication {
 
     public static void main(String[] args) {

@@ -1,0 +1,23 @@
+-- Slice 3: Auth (docs/slices/03-auth.md, Section 0), chunk 4 fix.
+-- Append-only: V1/V2 are never edited (CLAUDE.md: "Never edit an applied migration").
+--
+-- V2 already made x_user_id (X's immutable numeric id) the real identity key for
+-- community_manager, with x_handle explicitly staying mutable and "refreshed, not re-keyed" on
+-- every login -- but V1's uq_community_manager_x_handle UNIQUE constraint was never dropped.
+-- A UNIQUE constraint on a column that is no longer an identity key, and that this slice's own
+-- upsert refreshes via INSERT ... ON CONFLICT (x_user_id) DO UPDATE, is actively wrong: Postgres
+-- still enforces every unique index during an INSERT attempt, not only the one named by
+-- ON CONFLICT's target. Two concurrent first-time logins for the SAME x_user_id (and therefore
+-- the same x_handle) can both attempt a real physical INSERT before either commits; the loser's
+-- attempt can trip uq_community_manager_x_handle before Postgres ever reaches the x_user_id
+-- conflict resolution, surfacing as an unhandled 500 instead of the graceful UPDATE this upsert
+-- is supposed to fall back to. Caught directly by
+-- OAuthLoginFlowTest#concurrentFirstTimeLoginsForSameXUserCreateExactlyOneRow, which asserts both
+-- concurrent requests return a clean 200, not just that the row count ends at 1.
+--
+-- x_handle keeps its NOT NULL (every login always supplies one); only the UNIQUE constraint is
+-- dropped. X itself already enforces handle uniqueness on its own platform -- this app re-deriving
+-- that as a second, redundant constraint is exactly what breaks the upsert above, for no
+-- correctness benefit this app actually needs (x_user_id already is the one column this app's
+-- own identity logic depends on being unique).
+ALTER TABLE community_manager DROP CONSTRAINT uq_community_manager_x_handle;
