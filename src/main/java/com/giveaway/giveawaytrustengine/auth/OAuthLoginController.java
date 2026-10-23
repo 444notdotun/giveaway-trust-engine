@@ -183,12 +183,22 @@ public class OAuthLoginController {
         }
         // xAccessToken is never used again past this point -- discarded, not persisted or logged.
 
-        CommunityManagerRepository.UpsertResult upsertResult = communityManagerRepository.getObject()
-                .upsertByXUserId(userInfo.xUserId(), userInfo.username());
+        CommunityManagerRepository.UpsertResult upsertResult;
+        RefreshResult refreshResult;
+        try {
+            upsertResult = communityManagerRepository.getObject()
+                    .upsertByXUserId(userInfo.xUserId(), userInfo.username());
 
-        UUID familyId = UUID.randomUUID();
-        RefreshResult refreshResult = refreshTokenService.getObject()
-                .issueInitialRefreshToken(upsertResult.cmId(), familyId);
+            UUID familyId = UUID.randomUUID();
+            refreshResult = refreshTokenService.getObject()
+                    .issueInitialRefreshToken(upsertResult.cmId(), familyId);
+        }
+        catch (IllegalStateException dbFailure) {
+            // A genuine DB failure (e.g. a statement_timeout firing under row-lock contention,
+            // item 2 of the chunk 4 review) says nothing about the caller's credentials -- never
+            // the 400/401 family, which this controller's other branches already use for that.
+            return serviceUnavailable("db-unavailable");
+        }
 
         ResponseCookie accessCookie = sessionCookie(
                 "accessToken", refreshResult.newAccessToken(), cookieProperties.path(), cookieProperties.accessTokenMaxAge());

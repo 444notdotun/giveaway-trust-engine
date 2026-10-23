@@ -104,6 +104,7 @@ class OAuthLoginFlowTest {
                         "--spring.datasource.url=" + POSTGRES.getJdbcUrl(),
                         "--spring.datasource.username=" + POSTGRES.getUsername(),
                         "--spring.datasource.password=" + POSTGRES.getPassword(),
+                        "--spring.datasource.hikari.connection-init-sql=SET statement_timeout=3000",
                         "--spring.data.redis.host=" + REDIS.getHost(),
                         "--spring.data.redis.port=" + REDIS.getMappedPort(6379),
                         "--spring.data.redis.password=" + REDIS_PASSWORD,
@@ -495,6 +496,66 @@ class OAuthLoginFlowTest {
                 .as("no half-created row from a user-lookup timeout, even though the token "
                         + "exchange itself already succeeded")
                 .isEqualTo(before);
+    }
+
+    // Chunk 4 review (second round), item 2: a genuine DB failure during the upsert (a locked
+    // row blocking past the statement_timeout bound) must fail closed as 503, with an empty
+    // generic body and no half-created row -- never a raw 500. The lock is held on a row that
+    // ALREADY EXISTS for this x_user_id, so the callback's INSERT ... ON CONFLICT DO UPDATE must
+    // wait for it specifically (a fresh x_user_id with no existing row would never need the lock
+    // at all).
+    @Test
+    @org.junit.jupiter.api.Timeout(value = 20, unit = java.util.concurrent.TimeUnit.SECONDS)
+    void dbFailureDuringUpsertReturns503AndCreatesNoHalfCreatedRow(CapturedOutput output) throws Exception {
+        String xUserId = uniqueNumericXUserId();
+
+        try (Connection setup = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+                java.sql.PreparedStatement ps = setup.prepareStatement(
+                        "INSERT INTO community_manager (id, x_handle, created_at, x_user_id) VALUES (?,?,?,?)")) {
+            ps.setObject(1, UUID.randomUUID());
+            ps.setString(2, "lockholder_db_fail");
+            ps.setTimestamp(3, java.sql.Timestamp.from(java.time.Instant.now()));
+            ps.setString(4, xUserId);
+            ps.executeUpdate();
+        }
+
+        Connection lockHolder = DriverManager.getConnection(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+        lockHolder.setAutoCommit(false);
+        try (java.sql.PreparedStatement ps = lockHolder.prepareStatement(
+                "SELECT id FROM community_manager WHERE x_user_id = ? FOR UPDATE")) {
+            ps.setString(1, xUserId);
+            ps.executeQuery();
+        }
+
+        try {
+            HttpResponse<Void> loginResponse = startLogin();
+            String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
+            String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
+            String code = "code-" + UUID.randomUUID();
+            String accessToken = "access-" + UUID.randomUUID();
+            stubTokenExchangeSuccess(code, accessToken);
+            stubUserLookupSuccess(accessToken, xUserId, "db_fail_handle");
+
+            int before = countAllCommunityManagers();
+            HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
+
+            assertThat(response.statusCode())
+                    .as("a DB failure during the upsert must fail closed as 503, never a raw 500")
+                    .isEqualTo(503);
+            assertThat(response.body()).isEmpty();
+            assertThat(countAllCommunityManagers())
+                    .as("no half-created (or half-updated) row from this DB failure")
+                    .isEqualTo(before);
+
+            assertThat(output.getAll())
+                    .as("the failure-reason log must name the category")
+                    .contains("reason=db-unavailable");
+        } finally {
+            lockHolder.rollback();
+            lockHolder.close();
+        }
     }
 
     // Failure test 18 (Section 5.18): two concurrent first-time logins resolving to the SAME
