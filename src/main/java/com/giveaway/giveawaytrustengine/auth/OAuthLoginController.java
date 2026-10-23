@@ -2,8 +2,11 @@ package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.config.CookieProperties;
 import com.giveaway.giveawaytrustengine.config.XOAuthProperties;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -44,6 +47,16 @@ import java.util.UUID;
 @RestController
 public class OAuthLoginController {
 
+    private static final Logger log = LoggerFactory.getLogger(OAuthLoginController.class);
+
+    /**
+     * Chunk 4 review, item 2: one failure-reason-tagged counter and one WARN log line (naming
+     * only the {@code reason} category -- never {@code state}, {@code code}, or any token/secret
+     * value) for every rejection branch below, on both {@code /auth/login} and
+     * {@code /auth/callback}.
+     */
+    private static final String FAILURE_COUNTER_NAME = "giveaway.oauth.failure";
+
     /**
      * Chunk 4 review, item 1 (login CSRF). {@code SameSite=Lax}, NOT {@code Strict} -- this
      * cookie must still be present when X's cross-site, top-level redirect lands on
@@ -62,24 +75,32 @@ public class OAuthLoginController {
     private final XOAuthClient xOAuthClient;
     private final ObjectProvider<CommunityManagerRepository> communityManagerRepository;
     private final ObjectProvider<RefreshTokenService> refreshTokenService;
+    private final MeterRegistry meterRegistry;
 
     public OAuthLoginController(XOAuthProperties oAuthProperties, CookieProperties cookieProperties,
             ObjectProvider<OAuthStateService> oauthStateService, XOAuthClient xOAuthClient,
             ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-            ObjectProvider<RefreshTokenService> refreshTokenService) {
+            ObjectProvider<RefreshTokenService> refreshTokenService, MeterRegistry meterRegistry) {
         this.oAuthProperties = oAuthProperties;
         this.cookieProperties = cookieProperties;
         this.oauthStateService = oauthStateService;
         this.xOAuthClient = xOAuthClient;
         this.communityManagerRepository = communityManagerRepository;
         this.refreshTokenService = refreshTokenService;
+        this.meterRegistry = meterRegistry;
     }
 
     @GetMapping("/auth/login")
     public ResponseEntity<Void> login() {
         String verifier = PkceChallenge.generateVerifier();
         String challenge = PkceChallenge.challengeFor(verifier);
-        OAuthStateService.StateCreationResult created = oauthStateService.getObject().createState(verifier);
+        OAuthStateService.StateCreationResult created;
+        try {
+            created = oauthStateService.getObject().createState(verifier);
+        }
+        catch (OAuthStateUnavailableException redisUnavailable) {
+            return serviceUnavailable("redis-unavailable");
+        }
 
         String redirectTo = oAuthProperties.authorizeUrl()
                 + "?response_type=" + enc("code")
@@ -109,28 +130,34 @@ public class OAuthLoginController {
         // X's own error parameter (e.g. the CM declined on X's consent screen): a clean 4xx,
         // never a stack trace and never an echo of the raw error text back to the browser.
         if (params.containsKey("error")) {
-            return badRequestClearingBindingCookie();
+            return badRequestClearingBindingCookie("x-error-param");
         }
 
         String state = params.get("state");
         String code = params.get("code");
         if (state == null || code == null) {
-            return badRequestClearingBindingCookie();
+            return badRequestClearingBindingCookie("missing-state-or-code");
         }
 
         // Single-use, atomic GETDEL -- taken FIRST, so a mismatched or missing binding cookie
         // still burns the state: a second attempt (with or without the correct cookie) can never
         // retry against the same state/code pair (chunk 4 review, item 1).
-        OAuthStateService.ConsumedState consumed = oauthStateService.getObject().consumeState(state);
+        OAuthStateService.ConsumedState consumed;
+        try {
+            consumed = oauthStateService.getObject().consumeState(state);
+        }
+        catch (OAuthStateUnavailableException redisUnavailable) {
+            return serviceUnavailable("redis-unavailable");
+        }
         if (consumed == null) {
-            return badRequestClearingBindingCookie();
+            return badRequestClearingBindingCookie("unknown-or-replayed-state");
         }
 
         String bindingCookieValue = readCookie(request, BINDING_COOKIE_NAME);
         if (bindingCookieValue == null || !bindingMatches(bindingCookieValue, consumed.bindingHashHex())) {
             // Missing and mismatched are rejected identically -- same generic 400 either way, no
             // distinguishing detail leaked about which case this was.
-            return badRequestClearingBindingCookie();
+            return badRequestClearingBindingCookie("missing-or-mismatched-binding-cookie");
         }
 
         String xAccessToken;
@@ -142,7 +169,7 @@ public class OAuthLoginController {
         catch (OAuthExchangeException exchangeFailure) {
             // Clean failure, no half-created row -- nothing has been written to the database yet
             // at this point, regardless of which of the two calls failed.
-            return badRequestClearingBindingCookie();
+            return badRequestClearingBindingCookie("x-exchange-failed");
         }
         // xAccessToken is never used again past this point -- discarded, not persisted or logged.
 
@@ -166,10 +193,22 @@ public class OAuthLoginController {
     }
 
     /** Every /auth/callback rejection clears the binding cookie -- it's single-use either way. */
-    private ResponseEntity<Void> badRequestClearingBindingCookie() {
+    private ResponseEntity<Void> badRequestClearingBindingCookie(String reason) {
+        recordFailure(reason);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .header(HttpHeaders.SET_COOKIE, clearingBindingCookie().toString())
                 .build();
+    }
+
+    private ResponseEntity<Void> serviceUnavailable(String reason) {
+        recordFailure(reason);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+    }
+
+    /** {@code reason} is always a fixed, short category -- never a state, code, or token value. */
+    private void recordFailure(String reason) {
+        log.warn("oauth login/callback rejected: reason={}", reason);
+        meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", reason).increment();
     }
 
     private ResponseCookie clearingBindingCookie() {

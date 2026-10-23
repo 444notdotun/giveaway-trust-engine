@@ -61,6 +61,9 @@ public class OAuthStateService {
         try (RedisConnection conn = connectionFactory.getConnection()) {
             conn.stringCommands().setEx(stateKey(state), ttl.toSeconds(), storedValue.getBytes(StandardCharsets.UTF_8));
         }
+        catch (RuntimeException redisFailure) {
+            throw new OAuthStateUnavailableException("oauth state store unavailable", redisFailure);
+        }
         return new StateCreationResult(state, bindingNonce);
     }
 
@@ -71,18 +74,22 @@ public class OAuthStateService {
      * this method only proves the state itself was once real.
      */
     public ConsumedState consumeState(String state) {
+        byte[] value;
         try (RedisConnection conn = connectionFactory.getConnection()) {
-            byte[] value = conn.stringCommands().getDel(stateKey(state));
-            if (value == null) {
-                return null;
-            }
-            String stored = new String(value, StandardCharsets.UTF_8);
-            int idx = stored.indexOf(DELIMITER);
-            if (idx < 0) {
-                return null;
-            }
-            return new ConsumedState(stored.substring(0, idx), stored.substring(idx + 1));
+            value = conn.stringCommands().getDel(stateKey(state));
         }
+        catch (RuntimeException redisFailure) {
+            throw new OAuthStateUnavailableException("oauth state store unavailable", redisFailure);
+        }
+        if (value == null) {
+            return null;
+        }
+        String stored = new String(value, StandardCharsets.UTF_8);
+        int idx = stored.indexOf(DELIMITER);
+        if (idx < 0) {
+            return null;
+        }
+        return new ConsumedState(stored.substring(0, idx), stored.substring(idx + 1));
     }
 
     private static byte[] stateKey(String state) {
