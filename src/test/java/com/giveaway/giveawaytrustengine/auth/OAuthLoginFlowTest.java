@@ -331,16 +331,30 @@ class OAuthLoginFlowTest {
 
     // Failure test 13 (Section 5.13): a callback with no state parameter, or one that doesn't
     // match any Redis entry, is rejected cleanly.
+    // Chunk 4 review, item 2: this rejection must also log a WARN tagged reason=missing-state-or-code.
     @Test
-    void missingStateOnCallbackIsRejected() throws Exception {
+    void missingStateOnCallbackIsRejected(CapturedOutput output) throws Exception {
         HttpResponse<String> response = callback("code=some-code");
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(500);
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=missing-state-or-code");
     }
 
+    // Chunk 4 review, item 2: this rejection must log a WARN tagged
+    // reason=unknown-or-replayed-state, and that log must NEVER contain the actual (unknown)
+    // state value itself -- only the fixed category.
     @Test
-    void unknownStateOnCallbackIsRejected() throws Exception {
-        HttpResponse<String> response = callback("code=some-code&state=totally-unknown-state-value");
+    void unknownStateOnCallbackIsRejected(CapturedOutput output) throws Exception {
+        String unknownState = "totally-unknown-state-value-" + UUID.randomUUID();
+        HttpResponse<String> response = callback("code=some-code&state=" + unknownState);
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(500);
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=unknown-or-replayed-state");
+        assertThat(output.getAll())
+                .as("the real (unknown) state value must never appear in any captured log line")
+                .doesNotContain(unknownState);
     }
 
     // Failure test 14 (Section 5.14): state replay -- using a state a second time, after its
@@ -400,17 +414,24 @@ class OAuthLoginFlowTest {
 
     // Failure test 16 (Section 5.16): X's own callback error parameter is handled cleanly, not
     // a crash -- e.g. the CM declined authorization on X's own consent screen.
+    // Chunk 4 review, item 2: this rejection must log a WARN tagged reason=x-error-param, and
+    // never echo X's own raw error text ("access_denied") into the log.
     @Test
-    void xsOwnCallbackErrorParameterHandledCleanly() throws Exception {
+    void xsOwnCallbackErrorParameterHandledCleanly(CapturedOutput output) throws Exception {
         HttpResponse<String> response = callback("error=access_denied");
         assertThat(response.statusCode()).isGreaterThanOrEqualTo(400).isLessThan(500);
         assertThat(response.statusCode()).isNotEqualTo(500);
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=x-error-param");
     }
 
     // Failure test 17 (Section 5.17), sub-case A: an X timeout during the TOKEN EXCHANGE call
     // leaves no half-created community_manager row.
+    // Chunk 4 review, item 2: this rejection must log a WARN tagged reason=x-exchange-failed, and
+    // that log must never contain the real code or X access token values.
     @Test
-    void timeoutDuringTokenExchangeLeavesNoHalfCreatedCommunityManagerRow() throws Exception {
+    void timeoutDuringTokenExchangeLeavesNoHalfCreatedCommunityManagerRow(CapturedOutput output) throws Exception {
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
         String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
@@ -433,6 +454,13 @@ class OAuthLoginFlowTest {
         assertThat(countAllCommunityManagers())
                 .as("no half-created row from a token-exchange timeout")
                 .isEqualTo(before);
+
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=x-exchange-failed");
+        assertThat(output.getAll())
+                .as("the real code value must never appear in any captured log line")
+                .doesNotContain(code);
     }
 
     // Failure test 17 (Section 5.17), sub-case B: an X timeout during the USER LOOKUP call
@@ -1054,8 +1082,10 @@ class OAuthLoginFlowTest {
     // Chunk 4 review, item 1: a callback with a genuinely valid state and code, but no
     // oauthBinding cookie at all, is rejected -- and rejected BEFORE either X call, so no
     // half-created row and no X traffic. FAILS TODAY: no binding check exists at all.
+    // Chunk 4 review, item 2: this rejection must also log a WARN tagged
+    // reason=missing-or-mismatched-binding-cookie.
     @Test
-    void callbackWithValidStateAndCodeButMissingBindingCookieIsRejected() throws Exception {
+    void callbackWithValidStateAndCodeButMissingBindingCookieIsRejected(CapturedOutput output) throws Exception {
         String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
@@ -1078,6 +1108,10 @@ class OAuthLoginFlowTest {
         String clearedBindingCookie = fullSetCookieHeader(response, "oauthBinding");
         assertThat(clearedBindingCookie).as("oauthBinding must be cleared even on this failure").isNotNull();
         assertThat(clearedBindingCookie).containsIgnoringCase("Max-Age=0");
+
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=missing-or-mismatched-binding-cookie");
     }
 
     // Chunk 4 review, item 1: a callback with the WRONG oauthBinding cookie is rejected, and the
@@ -1137,8 +1171,10 @@ class OAuthLoginFlowTest {
     // code and watching it still succeed. If the length bound were missing, or checked only after
     // the GETDEL, the first (oversized-code) attempt would have already burned the state, and this
     // second, otherwise-legitimate attempt would fail as "unknown/replayed state" instead.
+    // Chunk 4 review, item 2: the oversized-code rejection must log a WARN tagged
+    // reason=state-or-code-too-long, and that log must never contain the oversized code itself.
     @Test
-    void oversizedCodeIsRejectedWithoutBurningTheState() throws Exception {
+    void oversizedCodeIsRejectedWithoutBurningTheState(CapturedOutput output) throws Exception {
         String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
@@ -1148,6 +1184,12 @@ class OAuthLoginFlowTest {
         HttpResponse<String> firstAttempt = callback("code=" + oversizedCode + "&state=" + state, bindingCookie);
         assertThat(firstAttempt.statusCode()).isEqualTo(400);
         wireMock.verify(0, postRequestedFor(urlPathEqualTo("/2/oauth2/token")));
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=state-or-code-too-long");
+        assertThat(output.getAll())
+                .as("the oversized code value must never appear in any captured log line")
+                .doesNotContain(oversizedCode);
 
         String normalCode = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
