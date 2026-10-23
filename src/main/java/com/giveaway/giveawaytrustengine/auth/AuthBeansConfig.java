@@ -1,6 +1,8 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.config.JwtProperties;
+import com.giveaway.giveawaytrustengine.config.RevocationProperties;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -43,12 +45,14 @@ public class AuthBeansConfig {
 
     @Bean
     public RevocationChecker revocationChecker(ObjectProvider<LettuceConnectionFactory> connectionFactory,
-            ObjectProvider<DataSource> dataSource, Clock clock) {
+            ObjectProvider<DataSource> dataSource, Clock clock, RevocationProperties revocationProperties,
+            MeterRegistry meterRegistry) {
         LettuceConnectionFactory factory = connectionFactory.getIfAvailable();
         DataSource source = dataSource.getIfAvailable();
         if (factory == null || source == null) {
             return null;
         }
-        return new RevocationChecker(source, factory, clock, Duration.ofMinutes(15));
+        return new RevocationChecker(source, factory, clock, Duration.ofMinutes(15),
+                revocationProperties.epochTtl(), meterRegistry);
     }
 }

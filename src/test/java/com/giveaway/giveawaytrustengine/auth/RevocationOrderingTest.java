@@ -1,11 +1,15 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.TestImages;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
@@ -49,6 +53,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * throws) to prove the reverse ordering never happens, per the plan doc's letter.
  */
 @Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
 class RevocationOrderingTest {
 
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(TestImages.POSTGRES)
@@ -210,7 +215,7 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
     }
 
     private RevocationChecker checkerWithWorkingRedisAndBrokenDb() {
@@ -220,17 +225,22 @@ class RevocationOrderingTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(brokenDataSource(), factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(brokenDataSource(), factory, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
     }
 
     private RevocationChecker checkerWithUnreachableRedis() throws Exception {
+        return checkerWithUnreachableRedis(new SimpleMeterRegistry());
+    }
+
+    private RevocationChecker checkerWithUnreachableRedis(SimpleMeterRegistry meterRegistry) throws Exception {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration("127.0.0.1", findFreePort());
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
                 .commandTimeout(Duration.ofSeconds(2))
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(workingDataSource(), factory, CLOCK, Duration.ofMinutes(15),
+                Duration.ofHours(24), meterRegistry);
     }
 
     /** Seeds two fresh, never-used refresh_token rows for the given family. */
@@ -306,11 +316,14 @@ class RevocationOrderingTest {
 
     // Revocation ordering (Section 4): a Redis failure AFTER a successful DB write must still
     // leave the DB revoked, and the overall call must fail CLOSED (throw), never silently succeed.
+    // Also: this residual-window event must be operator-visible (plan doc's windows table) -- a
+    // WARN log line naming the familyId (never a token/secret) and a Micrometer counter.
     @Test
-    void redisFailureAfterSuccessfulDbWriteStillLeavesDbRevokedAndFailsClosed() throws Exception {
+    void redisFailureAfterSuccessfulDbWriteStillLeavesDbRevokedAndFailsClosed(CapturedOutput output) throws Exception {
         UUID familyId = UUID.randomUUID();
         seedFamily(familyId);
-        RevocationChecker checker = checkerWithUnreachableRedis();
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        RevocationChecker checker = checkerWithUnreachableRedis(meterRegistry);
 
         assertThatThrownBy(() -> checker.revokeFamily(familyId))
                 .as("revokeFamily must fail closed (throw) when the downstream Redis write fails, "
@@ -322,6 +335,16 @@ class RevocationOrderingTest {
                         + "failure -- DB-first ordering")
                 .isEqualTo(countTotalInFamily(familyId))
                 .isGreaterThan(0);
+
+        assertThat(output.getAll())
+                .as("one WARN log line naming the familyId must be emitted for this residual-"
+                        + "window event, so an operator can actually see it happening")
+                .contains("WARN")
+                .contains(familyId.toString());
+
+        assertThat(meterRegistry.counter("giveaway.revocation.redis.write.failed.after.db.commit").count())
+                .as("exactly one increment for this exact failure event")
+                .isEqualTo(1.0);
     }
 
     // Revocation ordering (Section 4): a DB failure must leave Redis completely untouched -- the

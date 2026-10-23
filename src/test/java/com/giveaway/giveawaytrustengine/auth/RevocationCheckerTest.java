@@ -4,6 +4,7 @@ import com.giveaway.giveawaytrustengine.TestImages;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
@@ -148,6 +149,35 @@ class RevocationCheckerTest {
         TLS_REDIS.start();
     }
 
+    /**
+     * {@code revocation-epoch} is a single GLOBAL key, shared across every test in this class
+     * (unlike {@code revoked:{familyId}}, which each test already isolates via a fresh random
+     * UUID). Without a reset, one test's manual TTL manipulation (e.g. {@code rawSetTtl}, used to
+     * simulate time passing) or epoch initialization can leak into a LATER test's observations,
+     * silently making it pass or fail for the wrong reason depending on execution order --
+     * caught directly: a full-class mutation run showed {@code epochKeyHasATtlAfterInit} passing
+     * under a mutation that removed all TTL-setting, only because an unrelated, earlier-run
+     * test's leftover manual TTL was still on the key. Flushing before every test removes that
+     * cross-test dependency entirely.
+     */
+    @BeforeEach
+    void resetRedisState() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
+                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
+        config.setPassword(REDIS_PASSWORD);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .useSsl().disablePeerVerification().and()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        try {
+            factory.getConnection().serverCommands().flushAll();
+        } finally {
+            factory.destroy();
+        }
+    }
+
     @AfterAll
     static void stopTlsRedis() {
         if (TLS_REDIS != null) {
@@ -190,6 +220,16 @@ class RevocationCheckerTest {
     }
 
     private RevocationChecker checkerWithPassword(String password) {
+        return checkerWithPassword(password, Duration.ofMinutes(15), Duration.ofHours(24));
+    }
+
+    /**
+     * {@code epochWindow} and {@code epochTtl} are both customizable (not just {@code epochTtl}
+     * against a hardcoded 15-minute window) so TTL-refresh tests can use a tiny window+TTL pair
+     * that still satisfies the constructor's own "epochTtl >= 2x epochWindow" validation, instead
+     * of waiting out a real 15-minute access-token-lifetime-sized window in a unit test.
+     */
+    private RevocationChecker checkerWithPassword(String password, Duration epochWindow, Duration epochTtl) {
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
                 TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
         config.setPassword(password);
@@ -199,7 +239,101 @@ class RevocationCheckerTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        return new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15));
+        return new RevocationChecker(postgresDataSource(), factory, CLOCK, epochWindow, epochTtl);
+    }
+
+    /** Reads the real TTL (seconds) of a key directly from Redis, bypassing RevocationChecker. */
+    private long rawTtlSeconds(String key) {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
+                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
+        config.setPassword(REDIS_PASSWORD);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .useSsl().disablePeerVerification().and()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        try {
+            Long ttl = factory.getConnection().keyCommands().ttl(key.getBytes());
+            return ttl == null ? -2 : ttl;
+        } finally {
+            factory.destroy();
+        }
+    }
+
+    /** Sets a key's TTL directly via Redis, bypassing RevocationChecker (simulates time passing). */
+    private void rawSetTtl(String key, long seconds) {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
+                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
+        config.setPassword(REDIS_PASSWORD);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .useSsl().disablePeerVerification().and()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        try {
+            factory.getConnection().keyCommands().expire(key.getBytes(), seconds);
+        } finally {
+            factory.destroy();
+        }
+    }
+
+    // Section 4a, item 1(a): the revocation-epoch key must have a TTL, not live forever -- a
+    // key with no TTL at all would violate CLAUDE.md's "every Redis key has a TTL" the same way
+    // an un-TTL'd revoked:{familyId} key would.
+    @Test
+    void epochKeyHasATtlAfterInit() {
+        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD, Duration.ofMinutes(15), Duration.ofHours(24));
+        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // triggers epoch init
+
+        long ttl = rawTtlSeconds("revocation-epoch");
+        assertThat(ttl)
+                .as("revocation-epoch must have a real TTL after being initialized, not live forever")
+                .isGreaterThan(0);
+    }
+
+    // Section 4a, item 1(b): a read refreshes (slides) the TTL -- it must not be left to coast
+    // down to expiry while the system is actively being used. Initialize with a short TTL,
+    // manually wind it down to simulate time passing, then prove a subsequent read pushes it
+    // back up rather than leaving it to keep decaying.
+    @Test
+    void readRefreshesTheEpochTtl() {
+        // A tiny window+TTL pair, not the real 15-minute access-token lifetime -- still
+        // satisfies the constructor's own "epochTtl >= 2x epochWindow" validation (4s >= 2x2s),
+        // without making this test wait out a real 15-minute window.
+        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD, Duration.ofSeconds(2), Duration.ofSeconds(10));
+        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // init, TTL ~10s
+
+        rawSetTtl("revocation-epoch", 2); // simulate most of the window having elapsed
+        assertThat(rawTtlSeconds("revocation-epoch")).isLessThanOrEqualTo(2);
+
+        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // the read to test
+
+        assertThat(rawTtlSeconds("revocation-epoch"))
+                .as("a read must refresh (slide) the TTL back up, not leave it decaying toward "
+                        + "the value we manually wound it down to")
+                .isGreaterThan(2);
+    }
+
+    // Section 4a, item 1(c): refreshing the TTL must not perturb the epoch's own VALUE -- a
+    // token issued after the epoch was established must still read as "not revoked" even after
+    // the key's TTL has been refreshed by an intervening read, proving the refresh only touches
+    // the key's lifetime, never the timestamp it stores.
+    @Test
+    void tokenIssuedAfterEpochStillNotRevokedAfterTtlRefresh() {
+        RevocationChecker checker = checkerWithPassword(REDIS_PASSWORD, Duration.ofSeconds(2), Duration.ofSeconds(10));
+        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // establishes epoch ~= FIXED_NOW
+
+        rawSetTtl("revocation-epoch", 2);
+        checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)); // refreshes TTL, same epoch value
+        assertThat(rawTtlSeconds("revocation-epoch")).isGreaterThan(2);
+
+        Instant afterEpoch = FIXED_NOW.plusSeconds(5);
+        assertThat(checker.isFamilyRevoked(UUID.randomUUID(), afterEpoch))
+                .as("a token issued after the epoch must still read as not-revoked even once the "
+                        + "epoch key's TTL has been refreshed by an intervening read")
+                .isFalse();
     }
 
     // Failure test 10 (Section 5.10): a connection over TLS with the correct password succeeds
@@ -272,7 +406,7 @@ class RevocationCheckerTest {
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
         factory.afterPropertiesSet();
-        RevocationChecker checker = new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker checker = new RevocationChecker(postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
 
         assertThatThrownBy(() -> checker.isFamilyRevoked(UUID.randomUUID(), FIXED_NOW.minusSeconds(60)))
                 .isInstanceOf(RevocationCheckUnavailableException.class);

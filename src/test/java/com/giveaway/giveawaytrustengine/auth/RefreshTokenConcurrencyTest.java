@@ -194,7 +194,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertFreshToken(tokenId, familyId, false);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
 
         CountDownLatch startLatch = new CountDownLatch(2);
@@ -241,7 +241,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenAId = UUID.randomUUID();
         String tokenACookie = insertFreshToken(tokenAId, familyId, false);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
 
         RefreshResult rotated = service.refresh(tokenACookie); // A -> B
@@ -275,7 +275,7 @@ class RefreshTokenConcurrencyTest {
         String tokenACookie = insertFreshToken(tokenAId, familyId, false);
         String tokenCCookie = insertFreshToken(tokenCId, familyId, false); // sibling, never touched
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
 
         service.refresh(tokenACookie); // rotates A -> new token, family now partially used
@@ -295,7 +295,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertFreshToken(tokenId, familyId, false);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
 
         RefreshResult result = service.refresh(cookieValue);
@@ -324,7 +324,7 @@ class RefreshTokenConcurrencyTest {
     void refreshTokensAreStoredHashedNeverRawInTokenHashColumn() throws Exception {
         UUID familyId = UUID.randomUUID();
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
 
         // RED: issueInitialRefreshToken always throws UnsupportedOperationException today -- this
@@ -358,7 +358,7 @@ class RefreshTokenConcurrencyTest {
         UUID tokenId = UUID.randomUUID();
         String cookieValue = insertExpiredToken(tokenId, familyId);
 
-        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
         RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
 
         org.junit.jupiter.api.Assertions.assertThrows(ExpiredRefreshTokenException.class,
