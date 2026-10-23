@@ -777,19 +777,34 @@ class OAuthLoginFlowTest {
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("no refreshToken Set-Cookie header found"));
 
-        // THEN: flags on each cookie individually.
+        // THEN: flags common to both cookies.
         for (String cookie : List.of(accessCookie, refreshCookie)) {
             assertThat(cookie).contains("HttpOnly");
             assertThat(cookie).contains("Secure");
             assertThat(cookie).contains("SameSite=Strict");
-            assertThat(cookie).contains("Path=/");
             assertThat(cookie).contains("Max-Age=");
         }
+
+        // Chunk 4 review, item 3: the refresh cookie is scoped to /auth/refresh specifically
+        // (not every endpoint), since it's the only place this app will ever need to read it --
+        // the access cookie stays scoped to "/" since every authenticated endpoint reads it.
+        assertThat(pathOf(accessCookie)).as("access cookie Path").isEqualTo("/");
+        assertThat(pathOf(refreshCookie)).as("refresh cookie Path").isEqualTo("/auth/refresh");
 
         // Access cookie Max-Age matches the 15-minute access-token lifetime; refresh cookie
         // Max-Age matches the 7-day refresh-token lifetime (Section 3).
         assertThat(maxAgeOf(accessCookie)).isEqualTo(Duration.ofMinutes(15).toSeconds());
         assertThat(maxAgeOf(refreshCookie)).isEqualTo(Duration.ofDays(7).toSeconds());
+    }
+
+    private static String pathOf(String setCookieHeader) {
+        for (String part : setCookieHeader.split(";")) {
+            String trimmed = part.trim();
+            if (trimmed.toLowerCase().startsWith("path=")) {
+                return trimmed.substring("path=".length());
+            }
+        }
+        throw new AssertionError("no Path attribute found in: " + setCookieHeader);
     }
 
     private static long maxAgeOf(String setCookieHeader) {

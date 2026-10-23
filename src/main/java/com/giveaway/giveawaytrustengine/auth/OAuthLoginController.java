@@ -181,9 +181,9 @@ public class OAuthLoginController {
                 .issueInitialRefreshToken(upsertResult.cmId(), familyId);
 
         ResponseCookie accessCookie = sessionCookie(
-                "accessToken", refreshResult.newAccessToken(), cookieProperties.accessTokenMaxAge());
-        ResponseCookie refreshCookie = sessionCookie(
-                "refreshToken", refreshResult.newRefreshCookieValue(), cookieProperties.refreshTokenMaxAge());
+                "accessToken", refreshResult.newAccessToken(), cookieProperties.path(), cookieProperties.accessTokenMaxAge());
+        ResponseCookie refreshCookie = sessionCookie("refreshToken", refreshResult.newRefreshCookieValue(),
+                cookieProperties.refreshTokenPath(), cookieProperties.refreshTokenMaxAge());
 
         return ResponseEntity.ok()
                 .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
@@ -241,12 +241,12 @@ public class OAuthLoginController {
         return MessageDigest.isEqual(actual, expected);
     }
 
-    private ResponseCookie sessionCookie(String name, String value, Duration maxAge) {
+    private ResponseCookie sessionCookie(String name, String value, String path, Duration maxAge) {
         return ResponseCookie.from(name, value)
                 .httpOnly(true)
                 .secure(true)
                 .sameSite("Strict")
-                .path(cookieProperties.path())
+                .path(path)
                 .maxAge(maxAge)
                 .build();
     }
