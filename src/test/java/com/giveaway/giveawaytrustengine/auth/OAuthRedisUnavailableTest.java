@@ -103,6 +103,10 @@ class OAuthRedisUnavailableTest {
 
     @Test
     void loginReturns503WhenRedisUnavailable(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appWithRedisDown.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double failuresBefore = meterRegistry.counter("giveaway.auth.failure", "reason", "redis-unavailable").count();
+
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(baseUri() + "/auth/login"))
                 .GET()
@@ -120,10 +124,18 @@ class OAuthRedisUnavailableTest {
         assertThat(output.getAll())
                 .as("the failure-reason log must name the category, never a token/secret value")
                 .contains("redis-unavailable");
+        // Chunk 4 review (final round), item 2: one counter name for every auth failure --
+        // giveaway.auth.failure, not a separate giveaway.oauth.failure for this controller.
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "redis-unavailable").count())
+                .isGreaterThan(failuresBefore);
     }
 
     @Test
     void callbackReturns503WhenRedisUnavailableAndLogsNoStateOrCode(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appWithRedisDown.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double failuresBefore = meterRegistry.counter("giveaway.auth.failure", "reason", "redis-unavailable").count();
+
         String state = "state-" + UUID.randomUUID();
         String code = "code-" + UUID.randomUUID();
 
@@ -147,5 +159,7 @@ class OAuthRedisUnavailableTest {
         assertThat(output.getAll())
                 .as("the failure-reason log must name the category, never a token/secret value")
                 .contains("redis-unavailable");
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "redis-unavailable").count())
+                .isGreaterThan(failuresBefore);
     }
 }

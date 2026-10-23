@@ -54,8 +54,14 @@ public class OAuthLoginController {
      * only the {@code reason} category -- never {@code state}, {@code code}, or any token/secret
      * value) for every rejection branch below, on both {@code /auth/login} and
      * {@code /auth/callback}.
+     *
+     * Chunk 4 review (final round), item 2: same counter name every other auth-failure site in
+     * this package uses -- {@code giveaway.auth.failure} -- not a separate {@code
+     * giveaway.oauth.failure} just for this controller. An operator alerting on {@code
+     * giveaway.auth.failure} must see every auth failure, including CSRF/state rejections and
+     * X-exchange failures, not just the refresh-token and revocation paths.
      */
-    private static final String FAILURE_COUNTER_NAME = "giveaway.oauth.failure";
+    private static final String FAILURE_COUNTER_NAME = "giveaway.auth.failure";
 
     /**
      * Chunk 4 review, item 1 (login CSRF). {@code SameSite=Lax}, NOT {@code Strict} -- this
