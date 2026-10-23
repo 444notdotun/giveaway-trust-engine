@@ -223,11 +223,25 @@ class RefreshEndpointTest {
         assertThat(isUsed(tokenId)).as("the old token must now be used").isTrue();
     }
 
+    // Chunk 4 review (second round), item 3: the missing-cookie case must route through the same
+    // recordFailure("malformed") path as every other RefreshTokenService rejection -- it must
+    // log and count, not short-circuit silently before RefreshTokenService ever sees it.
     @Test
-    void missingCookieReturns401() throws Exception {
+    void missingCookieReturns401(CapturedOutput output) throws Exception {
+        io.micrometer.core.instrument.MeterRegistry meterRegistry =
+                appContext.getBean(io.micrometer.core.instrument.MeterRegistry.class);
+        double before = meterRegistry.counter("giveaway.auth.failure", "reason", "malformed").count();
+
         HttpResponse<String> response = callRefresh(null);
+
         assertThat(response.statusCode()).isEqualTo(401);
         assertThat(response.body()).isEmpty();
+        assertThat(output.getAll())
+                .as("the missing-cookie case must log the same reason as every other rejection")
+                .contains("reason=malformed");
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "malformed").count())
+                .as("the malformed counter must have incremented for the missing-cookie case too")
+                .isGreaterThan(before);
     }
 
     @Test

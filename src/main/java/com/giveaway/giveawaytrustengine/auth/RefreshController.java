@@ -51,10 +51,12 @@ public class RefreshController {
 
     @PostMapping("/auth/refresh")
     public ResponseEntity<Void> refresh(HttpServletRequest request) {
+        // No short-circuit on a missing cookie -- passed straight into
+        // RefreshTokenService.refresh (null included), whose own parseCookie already treats
+        // null/empty/oversized identically to every other malformed case: the same
+        // recordFailure("malformed") log+counter path, not a silent bypass of it (item 3,
+        // chunk 4 review, second round).
         String cookieValue = readCookie(request, REFRESH_COOKIE_NAME);
-        if (cookieValue == null) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
-        }
 
         RefreshResult result;
         try {
