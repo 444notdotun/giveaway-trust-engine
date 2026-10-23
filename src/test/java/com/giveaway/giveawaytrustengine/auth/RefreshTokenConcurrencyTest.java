@@ -56,6 +56,7 @@ class RefreshTokenConcurrencyTest {
                 .migrate();
     }
 
+    private static final String SIGNING_KEY = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
     private static final Instant FIXED_NOW = Instant.parse("2026-10-21T12:00:00Z");
     private static final Clock CLOCK = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
 
@@ -195,7 +196,7 @@ class RefreshTokenConcurrencyTest {
         String cookieValue = insertFreshToken(tokenId, familyId, false);
 
         RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
-        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         CountDownLatch startLatch = new CountDownLatch(2);
         CountDownLatch doneLatch = new CountDownLatch(2);
@@ -242,7 +243,7 @@ class RefreshTokenConcurrencyTest {
         String tokenACookie = insertFreshToken(tokenAId, familyId, false);
 
         RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
-        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         RefreshResult rotated = service.refresh(tokenACookie); // A -> B
         assertThat(rotated).isNotNull();
@@ -276,7 +277,7 @@ class RefreshTokenConcurrencyTest {
         String tokenCCookie = insertFreshToken(tokenCId, familyId, false); // sibling, never touched
 
         RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
-        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         service.refresh(tokenACookie); // rotates A -> new token, family now partially used
         org.junit.jupiter.api.Assertions.assertThrows(ReuseDetectedException.class,
@@ -296,7 +297,7 @@ class RefreshTokenConcurrencyTest {
         String cookieValue = insertFreshToken(tokenId, familyId, false);
 
         RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
-        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         RefreshResult result = service.refresh(cookieValue);
 
@@ -325,16 +326,22 @@ class RefreshTokenConcurrencyTest {
         UUID familyId = UUID.randomUUID();
 
         RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
-        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
-        // RED: issueInitialRefreshToken always throws UnsupportedOperationException today -- this
-        // fails here, before the hash assertion below is ever reached, same as every other
-        // not-implemented refresh() call in this class.
         RefreshResult result = service.issueInitialRefreshToken(cmId, familyId);
 
         assertThat(result).isNotNull();
         String rawCookieValue = result.newRefreshCookieValue();
-        String rawSecretHalf = rawCookieValue.substring(rawCookieValue.indexOf('.') + 1);
+        String rawSecretHalfBase64 = rawCookieValue.substring(rawCookieValue.indexOf('.') + 1);
+        // The cookie's secret half is base64url-ENCODED -- decode it to get the actual raw
+        // secret bytes. Comparing against the base64 STRING's own UTF-8 bytes (a prior version
+        // of this test's bug) can never catch a mutation that stores the raw secret directly:
+        // the encoded string's bytes and the real raw secret bytes have different lengths and
+        // values regardless of whether real hashing happens, so that comparison always passes
+        // vacuously. Confirmed directly: a mutation storing the raw secret via
+        // `ps.setBytes(5, secret)` instead of `ps.setBytes(5, sha256(secret))` passed this test
+        // unmodified -- this decode is the fix.
+        byte[] rawSecretBytes = java.util.Base64.getUrlDecoder().decode(rawSecretHalfBase64);
 
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(
@@ -345,7 +352,7 @@ class RefreshTokenConcurrencyTest {
             byte[] storedHash = rs.getBytes("token_hash");
             assertThat(storedHash)
                     .as("the raw secret must never be stored literally as token_hash")
-                    .isNotEqualTo(rawSecretHalf.getBytes());
+                    .isNotEqualTo(rawSecretBytes);
         }
     }
 
@@ -359,7 +366,7 @@ class RefreshTokenConcurrencyTest {
         String cookieValue = insertExpiredToken(tokenId, familyId);
 
         RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15), Duration.ofHours(24));
-        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker);
+        RefreshTokenService service = new RefreshTokenService(dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK));
 
         org.junit.jupiter.api.Assertions.assertThrows(ExpiredRefreshTokenException.class,
                 () -> service.refresh(cookieValue));

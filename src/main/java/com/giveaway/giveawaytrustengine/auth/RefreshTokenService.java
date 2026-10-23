@@ -1,49 +1,268 @@
 package com.giveaway.giveawaytrustengine.auth;
 
-import java.time.Clock;
-import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.UUID;
 
 /**
  * Rotates refresh tokens and detects reuse. See docs/slices/03-auth.md, Section 2 (rotation)
- * and Section 4 (revocation).
+ * and Section 4 (revocation) -- CRITICAL REVIEW scope.
  *
- * RED stub (slice 3): {@link #refresh(String)} always throws {@link UnsupportedOperationException}
- * rather than returning a fixed wrong {@link RefreshResult} -- picked over a fake result because
- * every caller in {@code RefreshTokenConcurrencyTest} either asserts directly on the returned
- * {@link RefreshResult} (a fake value would produce a confusing downstream NullPointerException
- * or wrong-value assertion several lines away from the real problem) or distinguishes
- * {@link ReuseDetectedException} from "any other exception" (an unconditionally-thrown
- * {@code UnsupportedOperationException} lands cleanly in the "any other exception" bucket with
- * an unambiguous message). Real atomic rotation, reuse detection, and whole-family revocation
- * are not implemented yet.
+ * Refresh tokens are never JWTs: the cookie value is {@code base64url(tokenId) + "." +
+ * base64url(secret)} -- a split identifier+secret, matching {@code token_id} (the row's primary
+ * key) to a freshly generated, high-entropy secret whose SHA-256 hash is the only thing ever
+ * stored (Section 2: "stored hashed, never raw" -- {@code secretMatches} never compares the raw
+ * secret to anything persisted).
+ *
+ * <p><b>Single-use consumption and rotation happen in one database transaction</b>
+ * ({@link #atomicallyConsumeAndRotate}), not two separate statements each auto-committing on
+ * their own. This closes a real race beyond the atomic-UPDATE-with-WHERE-clause pattern alone
+ * (the same pattern CLAUDE.md's {@code claimRoll()} quota claim already uses): without the
+ * transaction, a losing thread's reuse-triggered {@code revokeFamily} call could run in the
+ * window between the winning thread's "mark old token used" commit and its "insert new token"
+ * commit, missing the brand-new rotated token entirely. Wrapping both statements in one
+ * transaction means Postgres's row lock on the {@code UPDATE} blocks a concurrent thread's own
+ * {@code UPDATE} attempt on the same row until this whole transaction -- update AND insert --
+ * has committed, so by the time a losing thread re-checks, the new token already exists and is
+ * caught by the family-wide revocation.
+ *
+ * <p>An unknown {@code token_id} and a wrong secret for a real {@code token_id} both throw the
+ * same {@link ReuseDetectedException} as genuine reuse -- deliberately indistinguishable from
+ * the outside, so a caller probing random token values learns nothing about which case actually
+ * happened. The same discipline applies to whether a reuse-triggered family revocation's Redis
+ * write succeeded or failed ({@link #revokeFamilySwallowingRedisFailure}): either way, the
+ * caller sees the identical generic rejection.
  */
 public class RefreshTokenService {
+
+    private static final Logger log = LoggerFactory.getLogger(RefreshTokenService.class);
+    private static final Duration REFRESH_TOKEN_LIFETIME = Duration.ofDays(7);
+    private static final int SECRET_LENGTH_BYTES = 32;
 
     private final DataSource dataSource;
     private final Clock clock;
     private final RevocationChecker revocationChecker;
+    private final JwtService jwtService;
 
-    public RefreshTokenService(DataSource dataSource, Clock clock, RevocationChecker revocationChecker) {
+    public RefreshTokenService(DataSource dataSource, Clock clock, RevocationChecker revocationChecker,
+            JwtService jwtService) {
         this.dataSource = dataSource;
         this.clock = clock;
         this.revocationChecker = revocationChecker;
+        this.jwtService = jwtService;
     }
 
     public RefreshResult refresh(String cookieValue) {
-        throw new UnsupportedOperationException("not implemented");
+        ParsedCookie parsed = parseCookie(cookieValue);
+
+        // Read outside the atomic-consume transaction, purely to validate the secret and expiry
+        // -- the single-use GUARANTEE comes entirely from the atomic UPDATE below (its WHERE
+        // used = false re-validates against the committed truth at that moment), so a stale read
+        // here is harmless, never load-bearing for correctness.
+        RowSnapshot row = selectRow(parsed.tokenId());
+        if (row == null || !secretMatches(parsed.secret(), row.tokenHash())) {
+            throw new ReuseDetectedException("refresh token invalid");
+        }
+        if (clock.instant().isAfter(row.expiresAt())) {
+            throw new ExpiredRefreshTokenException("refresh token expired");
+        }
+
+        AtomicConsumeResult consumed = atomicallyConsumeAndRotate(parsed.tokenId(), row.familyId(), row.cmId());
+        if (!consumed.won()) {
+            revokeFamilySwallowingRedisFailure(row.familyId());
+            throw new ReuseDetectedException("refresh token already used");
+        }
+
+        String newAccessToken = jwtService.issueAccessToken(row.cmId(), row.familyId());
+        String newCookieValue = buildCookieValue(consumed.newTokenId(), consumed.newSecret());
+        return new RefreshResult(newAccessToken, newCookieValue, row.familyId());
     }
 
     /**
      * Issues the very first refresh token for a brand-new session (called once at login, before
-     * any rotation has happened). See docs/slices/03-auth.md, Section 2.
-     *
-     * RED stub (slice 3): same pattern as {@link #refresh(String)} -- always throws
-     * {@link UnsupportedOperationException} rather than returning a fake {@link RefreshResult}.
-     * Real token generation, hashing, and insertion are not implemented yet.
+     * any rotation has happened) -- no old token to consume, so no race to guard here.
      */
     public RefreshResult issueInitialRefreshToken(UUID cmId, UUID familyId) {
-        throw new UnsupportedOperationException("not implemented");
+        UUID newTokenId = UUID.randomUUID();
+        byte[] newSecret = randomSecret();
+        insertNewToken(dataSource, newTokenId, familyId, cmId, newSecret, clock.instant().plus(REFRESH_TOKEN_LIFETIME));
+
+        String newAccessToken = jwtService.issueAccessToken(cmId, familyId);
+        String newCookieValue = buildCookieValue(newTokenId, newSecret);
+        return new RefreshResult(newAccessToken, newCookieValue, familyId);
+    }
+
+    private record AtomicConsumeResult(boolean won, UUID newTokenId, byte[] newSecret) {
+    }
+
+    private AtomicConsumeResult atomicallyConsumeAndRotate(UUID oldTokenId, UUID familyId, UUID cmId) {
+        UUID newTokenId = UUID.randomUUID();
+        byte[] newSecret = randomSecret();
+        byte[] newHash = sha256(newSecret);
+        Instant expiresAt = clock.instant().plus(REFRESH_TOKEN_LIFETIME);
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                int updated;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE refresh_token SET used = true WHERE token_id = ? AND used = false")) {
+                    ps.setObject(1, oldTokenId);
+                    updated = ps.executeUpdate();
+                }
+                if (updated == 0) {
+                    conn.rollback();
+                    return new AtomicConsumeResult(false, null, null);
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
+                                + "VALUES (?,?,?,false,?,?)")) {
+                    ps.setObject(1, newTokenId);
+                    ps.setObject(2, familyId);
+                    ps.setObject(3, cmId);
+                    ps.setTimestamp(4, Timestamp.from(expiresAt));
+                    ps.setBytes(5, newHash);
+                    ps.executeUpdate();
+                }
+                conn.commit();
+                return new AtomicConsumeResult(true, newTokenId, newSecret);
+            }
+            catch (SQLException e) {
+                conn.rollback();
+                throw new IllegalStateException("failed to rotate refresh token", e);
+            }
+        }
+        catch (SQLException e) {
+            throw new IllegalStateException("failed to rotate refresh token", e);
+        }
+    }
+
+    private static void insertNewToken(DataSource dataSource, UUID tokenId, UUID familyId, UUID cmId,
+            byte[] secret, Instant expiresAt) {
+        try (Connection conn = dataSource.getConnection();
+                PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
+                                + "VALUES (?,?,?,false,?,?)")) {
+            ps.setObject(1, tokenId);
+            ps.setObject(2, familyId);
+            ps.setObject(3, cmId);
+            ps.setTimestamp(4, Timestamp.from(expiresAt));
+            ps.setBytes(5, sha256(secret));
+            ps.executeUpdate();
+        }
+        catch (SQLException e) {
+            throw new IllegalStateException("failed to issue refresh token", e);
+        }
+    }
+
+    /**
+     * On reuse, the DB-side revocation (every token in the family marked {@code used = true})
+     * has already committed inside {@link RevocationChecker#revokeFamily} by the time it could
+     * possibly throw -- only the downstream Redis write can fail. Swallowed here (logged, not
+     * rethrown) so {@link #refresh(String)} always throws the identical {@link ReuseDetectedException}
+     * regardless of whether that Redis write succeeded: which outcome happened must never be
+     * observable from the response.
+     */
+    private void revokeFamilySwallowingRedisFailure(UUID familyId) {
+        try {
+            revocationChecker.revokeFamily(familyId);
+        }
+        catch (RuntimeException revocationFailure) {
+            log.warn("family revocation on reuse detection did not fully complete: familyId={}", familyId);
+        }
+    }
+
+    private RowSnapshot selectRow(UUID tokenId) {
+        try (Connection conn = dataSource.getConnection();
+                PreparedStatement ps = conn.prepareStatement(
+                        "SELECT family_id, cm_id, expires_at, token_hash FROM refresh_token WHERE token_id = ?")) {
+            ps.setObject(1, tokenId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                return new RowSnapshot(
+                        (UUID) rs.getObject("family_id"),
+                        (UUID) rs.getObject("cm_id"),
+                        rs.getTimestamp("expires_at").toInstant(),
+                        rs.getBytes("token_hash"));
+            }
+        }
+        catch (SQLException e) {
+            throw new IllegalStateException("failed to look up refresh token", e);
+        }
+    }
+
+    private record RowSnapshot(UUID familyId, UUID cmId, Instant expiresAt, byte[] tokenHash) {
+    }
+
+    private record ParsedCookie(UUID tokenId, byte[] secret) {
+    }
+
+    private static ParsedCookie parseCookie(String cookieValue) {
+        int dot = cookieValue.indexOf('.');
+        if (dot < 0) {
+            throw new ReuseDetectedException("malformed refresh token");
+        }
+        UUID tokenId;
+        try {
+            String tokenIdString = new String(
+                    Base64.getUrlDecoder().decode(cookieValue.substring(0, dot)), StandardCharsets.UTF_8);
+            tokenId = UUID.fromString(tokenIdString);
+        }
+        catch (RuntimeException malformed) {
+            throw new ReuseDetectedException("malformed refresh token");
+        }
+        byte[] secret;
+        try {
+            secret = Base64.getUrlDecoder().decode(cookieValue.substring(dot + 1));
+        }
+        catch (IllegalArgumentException malformed) {
+            throw new ReuseDetectedException("malformed refresh token");
+        }
+        return new ParsedCookie(tokenId, secret);
+    }
+
+    private static String buildCookieValue(UUID tokenId, byte[] secret) {
+        String tokenIdPart = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(tokenId.toString().getBytes(StandardCharsets.UTF_8));
+        String secretPart = Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+        return tokenIdPart + "." + secretPart;
+    }
+
+    /** Constant-time comparison -- never a timing side-channel on the hash check itself. */
+    private static boolean secretMatches(byte[] secret, byte[] storedHash) {
+        return MessageDigest.isEqual(sha256(secret), storedHash);
+    }
+
+    private static byte[] randomSecret() {
+        byte[] secret = new byte[SECRET_LENGTH_BYTES];
+        new SecureRandom().nextBytes(secret);
+        return secret;
+    }
+
+    private static byte[] sha256(byte[] value) {
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(value);
+        }
+        catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 must always be available", impossible);
+        }
     }
 }
