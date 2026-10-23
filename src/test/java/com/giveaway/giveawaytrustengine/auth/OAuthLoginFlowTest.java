@@ -164,6 +164,15 @@ class OAuthLoginFlowTest {
         return HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 
+    /**
+     * A fresh, unique, purely-numeric X user id (chunk 4 review, item 4: the real
+     * {@code XOAuthClient} now validates X's own {@code id} against {@code ^[0-9]{1,20}$}, so
+     * these test fixtures must look like plausible X ids, not an arbitrary label).
+     */
+    private static String uniqueNumericXUserId() {
+        return Long.toUnsignedString(java.util.concurrent.ThreadLocalRandom.current().nextLong());
+    }
+
     /** Extracts the raw {@code name=value} pair for one cookie from a response's Set-Cookie headers. */
     private static String setCookiePair(HttpResponse<?> response, String cookieName) {
         String full = fullSetCookieHeader(response, cookieName);
@@ -338,7 +347,7 @@ class OAuthLoginFlowTest {
     // first legitimate use already consumed and deleted the Redis entry, fails the same way.
     @Test
     void stateReplayIsRejected() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String location = loginResponse.headers().firstValue("Location").orElseThrow();
         String state = queryParam(location, "state");
@@ -458,7 +467,7 @@ class OAuthLoginFlowTest {
     // x_user_id create exactly one community_manager row, not two.
     @Test
     void concurrentFirstTimeLoginsForSameXUserCreateExactlyOneRow() throws Exception {
-        String sharedXUserId = "x-user-" + UUID.randomUUID();
+        String sharedXUserId = uniqueNumericXUserId();
 
         HttpResponse<Void> login1 = startLogin();
         String state1 = queryParam(login1.headers().firstValue("Location").orElseThrow(), "state");
@@ -531,7 +540,7 @@ class OAuthLoginFlowTest {
     // Failure test 19 (Section 5.19): a handle rename updates the SAME account, not a new one.
     @Test
     void handleRenameUpdatesSameAccountNotANewOne() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
 
         HttpResponse<Void> login1 = startLogin();
         String state1 = queryParam(login1.headers().firstValue("Location").orElseThrow(), "state");
@@ -550,7 +559,7 @@ class OAuthLoginFlowTest {
         String code2 = "code-2-" + UUID.randomUUID();
         String accessToken2 = "access-2-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code2, accessToken2);
-        stubUserLookupSuccess(accessToken2, xUserId, "new_handle_after_rename");
+        stubUserLookupSuccess(accessToken2, xUserId, "new_handle2");
         HttpResponse<String> second = callback("code=" + code2 + "&state=" + state2, bindingCookie2);
         assertThat(second.statusCode()).isBetween(200, 299);
 
@@ -559,14 +568,14 @@ class OAuthLoginFlowTest {
                 .isEqualTo(1);
         assertThat(handlesForXUserId(xUserId))
                 .as("x_handle must be refreshed to the new value on every login")
-                .containsExactly("new_handle_after_rename");
+                .containsExactly("new_handle2");
     }
 
     // Failure test 20 (Section 5.20): X's own tokens are discarded, not stored -- not in the
     // database, not in Redis, and not in any captured log line.
     @Test
     void xsOwnTokensAreDiscardedNotStored(CapturedOutput output) throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
         String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
@@ -641,7 +650,7 @@ class OAuthLoginFlowTest {
     // calls X at all, so no request to assert against exists yet.
     @Test
     void tokenExchangeRequestIncludesTheStoredPkceVerifier() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String location = loginResponse.headers().firstValue("Location").orElseThrow();
         String state = queryParam(location, "state");
@@ -652,7 +661,7 @@ class OAuthLoginFlowTest {
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupSuccess(accessToken, xUserId, "verifier_check_handle");
+        stubUserLookupSuccess(accessToken, xUserId, "verifier_chk");
 
         HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
         assertThat(response.statusCode()).isBetween(200, 299);
@@ -667,14 +676,14 @@ class OAuthLoginFlowTest {
     // there is nothing for an account_quota row to even reference.
     @Test
     void newCommunityManagerGetsExactlyOneAccountQuotaRow() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
         String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupSuccess(accessToken, xUserId, "quota_check_handle");
+        stubUserLookupSuccess(accessToken, xUserId, "quota_chk");
 
         HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
         assertThat(response.statusCode()).isBetween(200, 299);
@@ -692,7 +701,7 @@ class OAuthLoginFlowTest {
     // cookies.
     @Test
     void happyPathLoginCreatesRowAndSetsSessionCookiesWithExpectedFlags() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         assertThat(loginResponse.statusCode()).isEqualTo(302);
         String location = loginResponse.headers().firstValue("Location").orElseThrow();
@@ -707,7 +716,7 @@ class OAuthLoginFlowTest {
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupSuccess(accessToken, xUserId, "happy_path_handle");
+        stubUserLookupSuccess(accessToken, xUserId, "happy_handle");
 
         HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
         assertThat(response.statusCode()).isBetween(200, 299);
@@ -747,7 +756,7 @@ class OAuthLoginFlowTest {
     // SameSite=Strict, Path, Max-Age), for BOTH the access and refresh cookies.
     @Test
     void cookieFlagsAssertedDirectly() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String location = loginResponse.headers().firstValue("Location").orElseThrow();
         String state = queryParam(location, "state");
@@ -756,7 +765,7 @@ class OAuthLoginFlowTest {
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupSuccess(accessToken, xUserId, "cookie_flag_handle");
+        stubUserLookupSuccess(accessToken, xUserId, "cookie_flag");
 
         HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
 
@@ -1047,13 +1056,13 @@ class OAuthLoginFlowTest {
     // half-created row and no X traffic. FAILS TODAY: no binding check exists at all.
     @Test
     void callbackWithValidStateAndCodeButMissingBindingCookieIsRejected() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupSuccess(accessToken, xUserId, "no_cookie_handle");
+        stubUserLookupSuccess(accessToken, xUserId, "no_cookie_h");
 
         HttpResponse<String> response = callback("code=" + code + "&state=" + state); // no Cookie header at all
 
@@ -1078,7 +1087,7 @@ class OAuthLoginFlowTest {
     // the first call would succeed outright.
     @Test
     void callbackWithWrongBindingCookieBurnsStateAndRejects() throws Exception {
-        String xUserId = "x-user-" + UUID.randomUUID();
+        String xUserId = uniqueNumericXUserId();
         HttpResponse<Void> loginResponse = startLogin();
         String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
         String correctBindingCookie = setCookiePair(loginResponse, "oauthBinding");
@@ -1087,7 +1096,7 @@ class OAuthLoginFlowTest {
         String code = "code-" + UUID.randomUUID();
         String accessToken = "access-" + UUID.randomUUID();
         stubTokenExchangeSuccess(code, accessToken);
-        stubUserLookupSuccess(accessToken, xUserId, "wrong_cookie_handle");
+        stubUserLookupSuccess(accessToken, xUserId, "wrong_cookie");
 
         HttpResponse<String> firstAttempt = callback("code=" + code + "&state=" + state, wrongBindingCookie);
         assertThat(firstAttempt.statusCode())
@@ -1101,5 +1110,98 @@ class OAuthLoginFlowTest {
                 .as("the state was already consumed by the first (wrong-cookie) attempt's GETDEL")
                 .isEqualTo(400);
         assertThat(countCommunityManagersByXUserId(xUserId)).isEqualTo(0);
+    }
+
+    // Chunk 4 review, item 4: an oversized state parameter (>128 chars) is rejected with the
+    // generic 400 before X is ever touched. FAILS TODAY: no length bound exists, so an oversized
+    // (but Redis-unknown) state just falls through to the ordinary "unknown state" 400 -- this
+    // test's real job is the wireMock.verify(0, ...) below, proving X was never reached, which an
+    // unbounded implementation would still happen to satisfy by accident (unknown state already
+    // short-circuits before X) -- kept anyway as the direct, named proof the instruction asked
+    // for, with the oversized-code test below carrying the ordering proof that actually
+    // distinguishes "checked early" from "checked late / not at all".
+    @Test
+    void oversizedStateIsRejectedBeforeTouchingX() throws Exception {
+        String oversizedState = "a".repeat(129);
+        String code = "code-" + UUID.randomUUID();
+
+        HttpResponse<String> response = callback("code=" + code + "&state=" + oversizedState);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        wireMock.verify(0, postRequestedFor(urlPathEqualTo("/2/oauth2/token")));
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/2/users/me")));
+    }
+
+    // Chunk 4 review, item 4: an oversized code parameter (>512 chars) is rejected BEFORE the
+    // state is consumed -- proven by reusing the SAME real state afterward with a normal-length
+    // code and watching it still succeed. If the length bound were missing, or checked only after
+    // the GETDEL, the first (oversized-code) attempt would have already burned the state, and this
+    // second, otherwise-legitimate attempt would fail as "unknown/replayed state" instead.
+    @Test
+    void oversizedCodeIsRejectedWithoutBurningTheState() throws Exception {
+        String xUserId = uniqueNumericXUserId();
+        HttpResponse<Void> loginResponse = startLogin();
+        String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
+        String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
+
+        String oversizedCode = "c".repeat(513);
+        HttpResponse<String> firstAttempt = callback("code=" + oversizedCode + "&state=" + state, bindingCookie);
+        assertThat(firstAttempt.statusCode()).isEqualTo(400);
+        wireMock.verify(0, postRequestedFor(urlPathEqualTo("/2/oauth2/token")));
+
+        String normalCode = "code-" + UUID.randomUUID();
+        String accessToken = "access-" + UUID.randomUUID();
+        stubTokenExchangeSuccess(normalCode, accessToken);
+        stubUserLookupSuccess(accessToken, xUserId, "bounds_chk");
+
+        HttpResponse<String> secondAttempt = callback("code=" + normalCode + "&state=" + state, bindingCookie);
+        assertThat(secondAttempt.statusCode())
+                .as("the state must still be usable -- the oversized code must have been rejected "
+                        + "BEFORE the GETDEL, never burning the state")
+                .isBetween(200, 299);
+    }
+
+    // Chunk 4 review, item 4: X's own user-lookup response is validated, not trusted blindly.
+    // An id that isn't a plausible X numeric id (^[0-9]{1,20}$) is treated as a lookup failure --
+    // same clean 400, no half-created row. FAILS TODAY: no validation exists, so any string would
+    // be written straight into x_user_id.
+    @Test
+    void userLookupResponseWithInvalidIdFailsCleanly() throws Exception {
+        HttpResponse<Void> loginResponse = startLogin();
+        String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
+        String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
+        String code = "code-" + UUID.randomUUID();
+        String accessToken = "access-" + UUID.randomUUID();
+        stubTokenExchangeSuccess(code, accessToken);
+        wireMock.stubFor(get(urlEqualTo("/2/users/me"))
+                .withHeader("Authorization", equalTo("Bearer " + accessToken))
+                .willReturn(okJson("{\"data\":{\"id\":\"not-a-valid-id!!\",\"username\":\"validhandle\"}}")));
+
+        int before = countAllCommunityManagers();
+        HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(countAllCommunityManagers()).isEqualTo(before);
+    }
+
+    // Chunk 4 review, item 4: an invalid username (outside ^[A-Za-z0-9_]{1,15}$) is treated the
+    // same way -- a clean lookup failure, no row created.
+    @Test
+    void userLookupResponseWithInvalidUsernameFailsCleanly() throws Exception {
+        HttpResponse<Void> loginResponse = startLogin();
+        String state = queryParam(loginResponse.headers().firstValue("Location").orElseThrow(), "state");
+        String bindingCookie = setCookiePair(loginResponse, "oauthBinding");
+        String code = "code-" + UUID.randomUUID();
+        String accessToken = "access-" + UUID.randomUUID();
+        stubTokenExchangeSuccess(code, accessToken);
+        wireMock.stubFor(get(urlEqualTo("/2/users/me"))
+                .withHeader("Authorization", equalTo("Bearer " + accessToken))
+                .willReturn(okJson("{\"data\":{\"id\":\"1234567890\",\"username\":\"has a space\"}}")));
+
+        int before = countAllCommunityManagers();
+        HttpResponse<String> response = callback("code=" + code + "&state=" + state, bindingCookie);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(countAllCommunityManagers()).isEqualTo(before);
     }
 }

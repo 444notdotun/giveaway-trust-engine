@@ -69,6 +69,10 @@ public class OAuthLoginController {
     private static final String BINDING_COOKIE_PATH = "/auth";
     private static final Duration BINDING_COOKIE_MAX_AGE = Duration.ofSeconds(300);
 
+    /** Chunk 4 review, item 4: caller-supplied bound, checked before Redis or X is ever touched. */
+    private static final int MAX_STATE_LENGTH = 128;
+    private static final int MAX_CODE_LENGTH = 512;
+
     private final XOAuthProperties oAuthProperties;
     private final CookieProperties cookieProperties;
     private final ObjectProvider<OAuthStateService> oauthStateService;
@@ -137,6 +141,12 @@ public class OAuthLoginController {
         String code = params.get("code");
         if (state == null || code == null) {
             return badRequestClearingBindingCookie("missing-state-or-code");
+        }
+        // Chunk 4 review, item 4: bounds checked BEFORE the state is ever consumed (the GETDEL
+        // below) or X is ever called -- an oversized value is rejected for free, not after
+        // spending a Redis round-trip or (worse) an X HTTP call on it.
+        if (state.length() > MAX_STATE_LENGTH || code.length() > MAX_CODE_LENGTH) {
+            return badRequestClearingBindingCookie("state-or-code-too-long");
         }
 
         // Single-use, atomic GETDEL -- taken FIRST, so a mismatched or missing binding cookie

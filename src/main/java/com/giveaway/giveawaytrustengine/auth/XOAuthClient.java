@@ -12,6 +12,7 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.regex.Pattern;
 
 /**
  * The two outbound calls to X this slice ever makes: the token exchange and {@code GET
@@ -31,6 +32,14 @@ import java.util.Base64;
 public class XOAuthClient {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /**
+     * Chunk 4 review, item 4: X's own response is validated, not trusted blindly. A numeric X
+     * user id (up to 20 digits -- X ids are 64-bit integers) and a plausible X handle (letters,
+     * digits, underscore, 1-15 characters, per X's own handle rules).
+     */
+    private static final Pattern X_USER_ID_PATTERN = Pattern.compile("^[0-9]{1,20}$");
+    private static final Pattern X_USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{1,15}$");
 
     private final XOAuthProperties properties;
     private final HttpClient httpClient;
@@ -94,6 +103,9 @@ public class XOAuthClient {
         String username = data.path("username").asString(null);
         if (id == null || id.isBlank() || username == null || username.isBlank()) {
             throw new OAuthExchangeException("user lookup response missing id/username");
+        }
+        if (!X_USER_ID_PATTERN.matcher(id).matches() || !X_USERNAME_PATTERN.matcher(username).matches()) {
+            throw new OAuthExchangeException("user lookup response failed validation");
         }
         return new XUserInfo(id, username);
     }
