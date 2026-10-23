@@ -117,7 +117,13 @@ public class XOAuthClient {
         catch (HttpTimeoutException timeout) {
             throw new OAuthExchangeException(callName + " timed out", timeout);
         }
-        catch (IOException | InterruptedException failure) {
+        catch (InterruptedException interrupted) {
+            // Chunk 4 review, item 5: restore the flag before rethrowing -- swallowing it here
+            // would silently mask a cooperative cancellation/shutdown signal for this thread.
+            Thread.currentThread().interrupt();
+            throw new OAuthExchangeException(callName + " failed", interrupted);
+        }
+        catch (IOException failure) {
             throw new OAuthExchangeException(callName + " failed", failure);
         }
     }
