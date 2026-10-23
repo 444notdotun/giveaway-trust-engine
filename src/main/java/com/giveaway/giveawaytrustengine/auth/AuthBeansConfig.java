@@ -87,11 +87,11 @@ public class AuthBeansConfig {
     /** Returns {@code null} in contexts without a real {@code DataSource} -- same reasoning as above. */
     @Bean
     public RefreshTokenService refreshTokenService(ObjectProvider<DataSource> dataSource, Clock clock,
-            ObjectProvider<RevocationChecker> revocationChecker, JwtService jwtService) {
+            ObjectProvider<RevocationChecker> revocationChecker, JwtService jwtService, MeterRegistry meterRegistry) {
         DataSource source = dataSource.getIfAvailable();
         if (source == null) {
             return null;
         }
-        return new RefreshTokenService(source, clock, revocationChecker.getIfAvailable(), jwtService);
+        return new RefreshTokenService(source, clock, revocationChecker.getIfAvailable(), jwtService, meterRegistry);
     }
 }

@@ -62,7 +62,8 @@ class CmIdExtractionTest {
         FilterChain chain = (req, res) -> resolvedDuringRequest.set(
                 CurrentCommunityManager.cmId((HttpServletRequest) req));
 
-        new JwtAuthenticationFilter(jwtService).doFilter(request, response, chain);
+        new JwtAuthenticationFilter(jwtService, new io.micrometer.core.instrument.simple.SimpleMeterRegistry())
+                .doFilter(request, response, chain);
 
         assertThat(resolvedDuringRequest.get())
                 .as("cmId must come from the verified JWT, never the attacker-claimed request parameter")

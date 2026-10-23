@@ -1,5 +1,7 @@
 package com.giveaway.giveawaytrustengine.auth;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,17 +65,27 @@ public class RefreshTokenService {
      */
     static final String GENERIC_REJECTION_MESSAGE = "refresh token invalid";
 
+    /** Chunk 4 review, item 1: one counter, tagged by reason, for every auth failure path. */
+    private static final String FAILURE_COUNTER_NAME = "giveaway.auth.failure";
+
     private final DataSource dataSource;
     private final Clock clock;
     private final RevocationChecker revocationChecker;
     private final JwtService jwtService;
+    private final MeterRegistry meterRegistry;
 
     public RefreshTokenService(DataSource dataSource, Clock clock, RevocationChecker revocationChecker,
             JwtService jwtService) {
+        this(dataSource, clock, revocationChecker, jwtService, new SimpleMeterRegistry());
+    }
+
+    public RefreshTokenService(DataSource dataSource, Clock clock, RevocationChecker revocationChecker,
+            JwtService jwtService, MeterRegistry meterRegistry) {
         this.dataSource = dataSource;
         this.clock = clock;
         this.revocationChecker = revocationChecker;
         this.jwtService = jwtService;
+        this.meterRegistry = meterRegistry;
     }
 
     public RefreshResult refresh(String cookieValue) {
@@ -85,18 +97,26 @@ public class RefreshTokenService {
         // here is harmless, never load-bearing for correctness.
         RowSnapshot row = selectRow(parsed.tokenId());
         if (row == null || !secretMatches(parsed.secret(), row.tokenHash())) {
+            // Bucketed under "malformed" for log/metric purposes (item 1) -- an unknown token_id
+            // or a wrong secret for a real one is operationally the same "not a usable token"
+            // case as a malformed cookie, distinct from a CONFIRMED single-use violation
+            // (reuse-detected, below). The external response stays byte-identical either way
+            // (item 4) -- only the operator-facing log/counter distinguishes them.
+            recordFailure("malformed");
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         // Strict: accepted only while now is BEFORE expiresAt. now == expiresAt (not just
         // now.isAfter) is already expired -- the boundary instant itself does not get one more
         // accepted use.
         if (!clock.instant().isBefore(row.expiresAt())) {
+            recordFailure("expired");
             throw new ExpiredRefreshTokenException("refresh token expired");
         }
 
         AtomicConsumeResult consumed = atomicallyConsumeAndRotate(parsed.tokenId(), row.familyId(), row.cmId());
         if (!consumed.won()) {
             revokeFamilySwallowingRedisFailure(row.familyId());
+            recordFailure("reuse-detected");
             // Byte-identical to the "unknown token"/"wrong secret" rejection below -- never a
             // distinguishable message, so a caller can't tell reuse from an unknown token from
             // the response body alone (item 4).
@@ -239,12 +259,14 @@ public class RefreshTokenService {
      * NullPointerException} on {@code null}) or spend real work on (an attacker-sized string).
      * Checked first, rejected the same generic way as every other malformed case.
      */
-    private static ParsedCookie parseCookie(String cookieValue) {
+    private ParsedCookie parseCookie(String cookieValue) {
         if (cookieValue == null || cookieValue.isEmpty() || cookieValue.length() > MAX_COOKIE_LENGTH) {
+            recordFailure("malformed");
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         int dot = cookieValue.indexOf('.');
         if (dot < 0) {
+            recordFailure("malformed");
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         UUID tokenId;
@@ -254,6 +276,7 @@ public class RefreshTokenService {
             tokenId = UUID.fromString(tokenIdString);
         }
         catch (RuntimeException malformed) {
+            recordFailure("malformed");
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         byte[] secret;
@@ -261,9 +284,16 @@ public class RefreshTokenService {
             secret = Base64.getUrlDecoder().decode(cookieValue.substring(dot + 1));
         }
         catch (IllegalArgumentException malformed) {
+            recordFailure("malformed");
             throw new ReuseDetectedException(GENERIC_REJECTION_MESSAGE);
         }
         return new ParsedCookie(tokenId, secret);
+    }
+
+    /** {@code reason} is always a fixed, short category -- never the cookie, secret, or token value. */
+    private void recordFailure(String reason) {
+        log.warn("refresh rejected: reason={}", reason);
+        meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", reason).increment();
     }
 
     private static String buildCookieValue(UUID tokenId, byte[] secret) {

@@ -1,11 +1,15 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.TestImages;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -41,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * RED: {@code RefreshTokenService} and {@code ReuseDetectedException} do not exist yet.
  */
 @Testcontainers
+@ExtendWith(OutputCaptureExtension.class)
 class RefreshTokenConcurrencyTest {
 
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(TestImages.POSTGRES)
@@ -264,6 +269,85 @@ class RefreshTokenConcurrencyTest {
         // A subsequent refresh using B (the never-actually-compromised, newer token) must also fail.
         org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
                 () -> service.refresh(rotatedTokenBCookie));
+    }
+
+    // Chunk 4 review, item 1: genuine reuse must log a WARN tagged reason=reuse-detected and
+    // increment giveaway.auth.failure{reason=reuse-detected} -- and the log must never contain
+    // the cookie value or secret.
+    @Test
+    void reuseLogsReasonAndIncrementsCounter(CapturedOutput output) throws Exception {
+        UUID familyId = UUID.randomUUID();
+        UUID tokenId = UUID.randomUUID();
+        String cookieValue = insertFreshToken(tokenId, familyId, false);
+
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        RefreshTokenService service = new RefreshTokenService(
+                dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK), meterRegistry);
+
+        service.refresh(cookieValue); // rotates, consumes the only legitimate use
+        org.junit.jupiter.api.Assertions.assertThrows(ReuseDetectedException.class,
+                () -> service.refresh(cookieValue)); // reuse
+
+        assertThat(output.getAll()).contains("reason=reuse-detected");
+        assertThat(output.getAll()).as("the cookie value must never be logged").doesNotContain(cookieValue);
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "reuse-detected").count())
+                .isEqualTo(1.0);
+    }
+
+    // Chunk 4 review, item 1: an expired token must log a WARN tagged reason=expired and
+    // increment giveaway.auth.failure{reason=expired}.
+    @Test
+    void expiredTokenLogsReasonAndIncrementsCounter(CapturedOutput output) throws Exception {
+        UUID familyId = UUID.randomUUID();
+        UUID tokenId = UUID.randomUUID();
+        byte[] secret = new byte[32];
+        new SecureRandom().nextBytes(secret);
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(secret);
+        try (Connection conn = dataSource.getConnection();
+                PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO refresh_token (token_id, family_id, cm_id, used, expires_at, token_hash) "
+                                + "VALUES (?,?,?,false,?,?)")) {
+            ps.setObject(1, tokenId);
+            ps.setObject(2, familyId);
+            ps.setObject(3, cmId);
+            ps.setTimestamp(4, Timestamp.from(FIXED_NOW.minusSeconds(60))); // already expired
+            ps.setBytes(5, hash);
+            ps.executeUpdate();
+        }
+        String cookieValue = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenId.toString().getBytes())
+                + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        RefreshTokenService service = new RefreshTokenService(
+                dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK), meterRegistry);
+
+        org.junit.jupiter.api.Assertions.assertThrows(ExpiredRefreshTokenException.class,
+                () -> service.refresh(cookieValue));
+
+        assertThat(output.getAll()).contains("reason=expired");
+        assertThat(output.getAll()).as("the cookie value must never be logged").doesNotContain(cookieValue);
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "expired").count())
+                .isEqualTo(1.0);
+    }
+
+    // Chunk 4 review, item 1: a malformed cookie must log a WARN tagged reason=malformed and
+    // increment giveaway.auth.failure{reason=malformed}.
+    @Test
+    void malformedCookieLogsReasonAndIncrementsCounter(CapturedOutput output) {
+        RevocationChecker revocationChecker = new RevocationChecker(simpleDataSource(), null, CLOCK, Duration.ofMinutes(15));
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        RefreshTokenService service = new RefreshTokenService(
+                dataSource, CLOCK, revocationChecker, new JwtService(SIGNING_KEY, CLOCK), meterRegistry);
+        String garbageCookie = "not-a-real-cookie-value";
+
+        org.junit.jupiter.api.Assertions.assertThrows(ReuseDetectedException.class,
+                () -> service.refresh(garbageCookie));
+
+        assertThat(output.getAll()).contains("reason=malformed");
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "malformed").count())
+                .isEqualTo(1.0);
     }
 
     // Failure test 3 (Section 5.3): after family revocation, ANY further refresh attempt

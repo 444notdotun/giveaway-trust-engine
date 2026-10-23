@@ -1,5 +1,6 @@
 package com.giveaway.giveawaytrustengine.auth;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.ServletRequest;
@@ -36,10 +37,15 @@ public class JwtAuthenticationFilter implements jakarta.servlet.Filter {
 
     private static final Logger log = LoggerFactory.getLogger(JwtAuthenticationFilter.class);
 
-    private final JwtService jwtService;
+    /** Chunk 4 review, item 1: one counter, tagged by reason, for every auth failure path. */
+    private static final String FAILURE_COUNTER_NAME = "giveaway.auth.failure";
 
-    public JwtAuthenticationFilter(JwtService jwtService) {
+    private final JwtService jwtService;
+    private final MeterRegistry meterRegistry;
+
+    public JwtAuthenticationFilter(JwtService jwtService, MeterRegistry meterRegistry) {
         this.jwtService = jwtService;
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -59,6 +65,7 @@ public class JwtAuthenticationFilter implements jakarta.servlet.Filter {
                 // 2b's "log the reason, never the raw rejected value" discipline for this exact
                 // class of event.
                 log.warn("rejected access token: reason={}", invalid.reason());
+                meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", invalid.reason()).increment();
                 httpResponse.sendError(HttpServletResponse.SC_UNAUTHORIZED);
                 return;
             }

@@ -49,6 +49,8 @@ public class RevocationChecker {
     private static final String REVOKED_KEY_PREFIX = "revoked:";
     private static final String REDIS_WRITE_FAILED_AFTER_DB_COMMIT_COUNTER =
             "giveaway.revocation.redis.write.failed.after.db.commit";
+    /** Chunk 4 review, item 1: one counter, tagged by reason, for every auth failure path. */
+    private static final String FAILURE_COUNTER_NAME = "giveaway.auth.failure";
 
     private final DataSource dataSource;
     private final LettuceConnectionFactory connectionFactory;
@@ -69,12 +71,21 @@ public class RevocationChecker {
     }
 
     public boolean isFamilyRevoked(UUID familyId, Instant tokenIssuedAt) {
+        boolean revoked;
         try (RedisConnection conn = connectionFactory.getConnection()) {
-            return Boolean.TRUE.equals(conn.keyCommands().exists(revokedKey(familyId)));
+            revoked = Boolean.TRUE.equals(conn.keyCommands().exists(revokedKey(familyId)));
         }
         catch (RuntimeException redisFailure) {
+            // familyId only, never a token or secret -- same discipline as revokeFamily below.
+            log.warn("resolve revocation check rejected: reason=redis-unavailable familyId={}", familyId);
+            meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "redis-unavailable").increment();
             throw new RevocationCheckUnavailableException("revocation check could not be completed", redisFailure);
         }
+        if (revoked) {
+            log.warn("resolve revocation check rejected: reason=revoked familyId={}", familyId);
+            meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "revoked").increment();
+        }
+        return revoked;
     }
 
     public void revokeFamily(UUID familyId) {

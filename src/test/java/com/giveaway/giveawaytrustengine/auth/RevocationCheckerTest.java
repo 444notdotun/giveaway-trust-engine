@@ -1,6 +1,7 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.TestImages;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -353,5 +354,80 @@ class RevocationCheckerTest {
         assertThat(output.getAll())
                 .as("the full connection string shape (which embeds the password) must never appear")
                 .doesNotContain(fullConnectionStringShape);
+    }
+
+    // Chunk 4 review, item 1: a revoked family hitting isFamilyRevoked must log a WARN tagged
+    // reason=revoked and increment giveaway.auth.failure{reason=revoked}.
+    @Test
+    void revokedFamilyLogsReasonRevokedWithCounterIncrement(CapturedOutput output) {
+        UUID familyId = UUID.randomUUID();
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
+                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
+        config.setPassword(REDIS_PASSWORD);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .useSsl().disablePeerVerification().and()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        try {
+            factory.getConnection().stringCommands()
+                    .setEx(("revoked:" + familyId).getBytes(), 900, new byte[] {1});
+        } finally {
+            factory.destroy();
+        }
+
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        RevocationChecker checker = new RevocationChecker(
+                postgresDataSource(), connectionFactory(), CLOCK, Duration.ofMinutes(15), meterRegistry);
+
+        boolean revoked = checker.isFamilyRevoked(familyId, FIXED_NOW.minusSeconds(60));
+
+        assertThat(revoked).isTrue();
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category and the familyId")
+                .contains("reason=revoked")
+                .contains(familyId.toString());
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "revoked").count())
+                .isEqualTo(1.0);
+    }
+
+    // Chunk 4 review, item 1: Redis unreachable on isFamilyRevoked must log a WARN tagged
+    // reason=redis-unavailable and increment giveaway.auth.failure{reason=redis-unavailable}.
+    @Test
+    void redisUnavailableOnIsFamilyRevokedLogsReasonAndIncrementsCounter(CapturedOutput output) throws IOException {
+        int unreachablePort = findFreePort();
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration("127.0.0.1", unreachablePort);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        RevocationChecker checker = new RevocationChecker(
+                postgresDataSource(), factory, CLOCK, Duration.ofMinutes(15), meterRegistry);
+        UUID familyId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> checker.isFamilyRevoked(familyId, FIXED_NOW.minusSeconds(60)))
+                .isInstanceOf(RevocationCheckUnavailableException.class);
+
+        assertThat(output.getAll())
+                .as("the failure-reason log must name the category")
+                .contains("reason=redis-unavailable");
+        assertThat(meterRegistry.counter("giveaway.auth.failure", "reason", "redis-unavailable").count())
+                .isEqualTo(1.0);
+    }
+
+    private LettuceConnectionFactory connectionFactory() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(
+                TLS_REDIS.getHost(), TLS_REDIS.getMappedPort(6380));
+        config.setPassword(REDIS_PASSWORD);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .useSsl().disablePeerVerification().and()
+                .commandTimeout(Duration.ofSeconds(2))
+                .build();
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(config, clientConfig);
+        factory.afterPropertiesSet();
+        return factory;
     }
 }
