@@ -1,9 +1,9 @@
 package com.giveaway.giveawaytrustengine.quota;
 
 import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.datasource.DataSourceUtils;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
@@ -28,6 +28,16 @@ import java.util.UUID;
  * the database level, to any other legitimate refund. Closing that gap is an explicit
  * requirement on whoever calls this (slice 5): refund exactly once per failed giveaway, in the
  * same transaction as the giveaway's own state change.
+ *
+ * <p><b>Every method joins the caller's existing transaction, if there is one.</b> Connections
+ * are obtained via {@link DataSourceUtils#getConnection} and released via {@link
+ * DataSourceUtils#releaseConnection}, not {@code dataSource.getConnection()}/{@code
+ * connection.close()} directly -- the latter would always open a brand-new physical connection
+ * and auto-commit on it immediately, completely bypassing any Spring-managed transaction a
+ * caller (slice 5) has already started, so a rollback of the caller's transaction would never
+ * undo a claim or refund this service already committed on its own, separate connection. With
+ * no active transaction, {@code DataSourceUtils} behaves exactly like calling the plain
+ * {@code DataSource} methods directly -- existing non-transactional callers are unaffected.
  */
 public class AccountQuotaService {
 
@@ -37,10 +47,6 @@ public class AccountQuotaService {
 
     private final DataSource dataSource;
     private final MeterRegistry meterRegistry;
-
-    public AccountQuotaService(DataSource dataSource) {
-        this(dataSource, new SimpleMeterRegistry());
-    }
 
     public AccountQuotaService(DataSource dataSource, MeterRegistry meterRegistry) {
         this.dataSource = dataSource;
@@ -54,10 +60,10 @@ public class AccountQuotaService {
      * rejection; only for a genuine DB failure or a missing {@code account_quota} row.
      */
     public boolean claimRoll(UUID cmId) {
-        try (Connection conn = dataSource.getConnection();
-                PreparedStatement ps = conn.prepareStatement(
-                        "UPDATE account_quota SET rolls_used = rolls_used + 1 "
-                                + "WHERE cm_id = ? AND rolls_used < rolls_allocated")) {
+        Connection conn = DataSourceUtils.getConnection(dataSource);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE account_quota SET rolls_used = rolls_used + 1 "
+                        + "WHERE cm_id = ? AND rolls_used < rolls_allocated")) {
             ps.setObject(1, cmId);
             int updated = ps.executeUpdate();
             if (updated == 1) {
@@ -73,6 +79,9 @@ public class AccountQuotaService {
             recordDbFailure();
             throw new IllegalStateException("failed to claim roll", e);
         }
+        finally {
+            DataSourceUtils.releaseConnection(conn, dataSource);
+        }
     }
 
     /**
@@ -82,10 +91,10 @@ public class AccountQuotaService {
      * prevent a double refund; see the class Javadoc.
      */
     public boolean refundRoll(UUID cmId) {
-        try (Connection conn = dataSource.getConnection();
-                PreparedStatement ps = conn.prepareStatement(
-                        "UPDATE account_quota SET rolls_used = rolls_used - 1 "
-                                + "WHERE cm_id = ? AND rolls_used > 0")) {
+        Connection conn = DataSourceUtils.getConnection(dataSource);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE account_quota SET rolls_used = rolls_used - 1 "
+                        + "WHERE cm_id = ? AND rolls_used > 0")) {
             ps.setObject(1, cmId);
             int updated = ps.executeUpdate();
             if (updated == 1) {
@@ -104,6 +113,9 @@ public class AccountQuotaService {
             recordDbFailure();
             throw new IllegalStateException("failed to refund roll", e);
         }
+        finally {
+            DataSourceUtils.releaseConnection(conn, dataSource);
+        }
     }
 
     /**
@@ -120,9 +132,9 @@ public class AccountQuotaService {
         if (amount <= 0) {
             throw new IllegalArgumentException("amount must be positive, got " + amount);
         }
-        try (Connection conn = dataSource.getConnection();
-                PreparedStatement ps = conn.prepareStatement(
-                        "UPDATE account_quota SET rolls_allocated = rolls_allocated + ? WHERE cm_id = ?")) {
+        Connection conn = DataSourceUtils.getConnection(dataSource);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE account_quota SET rolls_allocated = rolls_allocated + ? WHERE cm_id = ?")) {
             ps.setInt(1, amount);
             ps.setObject(2, cmId);
             int updated = ps.executeUpdate();
@@ -137,6 +149,9 @@ public class AccountQuotaService {
         catch (SQLException e) {
             recordDbFailure();
             throw new IllegalStateException("failed to add rolls", e);
+        }
+        finally {
+            DataSourceUtils.releaseConnection(conn, dataSource);
         }
     }
 

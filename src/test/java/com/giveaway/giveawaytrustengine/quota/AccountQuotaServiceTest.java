@@ -1,6 +1,8 @@
 package com.giveaway.giveawaytrustengine.quota;
 
 import com.giveaway.giveawaytrustengine.TestImages;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
@@ -10,6 +12,8 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -178,6 +182,37 @@ class AccountQuotaServiceTest {
         return DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
     }
 
+    /**
+     * A real Hikari pool, sized and pre-warmed so pool exhaustion can never be what serializes
+     * the concurrency tests below -- every thread gets its own physical connection, so any
+     * serialization observed is the real row lock, not an artifact of a too-small pool.
+     * {@code minimumIdle == maximumPoolSize} makes Hikari open every connection eagerly at
+     * startup (same mechanism as slice 3's {@code HikariConnectionInitSqlStatementTimeoutTest}),
+     * but this additionally blocks until the pool actually reports {@code poolSize} total
+     * connections, so "pre-warmed" is a guarantee the test can rely on, not just an expectation.
+     */
+    private HikariDataSource prewarmedHikariDataSource(int poolSize) throws InterruptedException {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(POSTGRES.getJdbcUrl());
+        config.setUsername(POSTGRES.getUsername());
+        config.setPassword(POSTGRES.getPassword());
+        config.setMaximumPoolSize(poolSize);
+        config.setMinimumIdle(poolSize);
+        config.setConnectionTimeout(10000);
+        HikariDataSource ds = new HikariDataSource(config);
+
+        long deadlineNanos = System.nanoTime() + java.time.Duration.ofSeconds(10).toNanos();
+        while (ds.getHikariPoolMXBean().getTotalConnections() < poolSize) {
+            if (System.nanoTime() > deadlineNanos) {
+                ds.close();
+                throw new IllegalStateException(
+                        "Hikari pool did not pre-warm to " + poolSize + " connections in time");
+            }
+            Thread.sleep(25);
+        }
+        return ds;
+    }
+
     @BeforeEach
     void cleanTables() throws SQLException {
         try (Connection conn = rawConnection(); Statement st = conn.createStatement()) {
@@ -252,7 +287,7 @@ class AccountQuotaServiceTest {
     @Test
     void claimRollSucceedsAndIncrementsRollsUsedByExactlyOne() throws Exception {
         UUID cmId = newCmWithQuota(5, 2);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         boolean result = service.claimRoll(cmId);
 
@@ -264,7 +299,7 @@ class AccountQuotaServiceTest {
     @Test
     void claimRollReturnsFalseWhenNoRollLeft() throws Exception {
         UUID cmId = newCmWithQuota(3, 3); // exhausted
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         boolean result = service.claimRoll(cmId);
 
@@ -277,101 +312,117 @@ class AccountQuotaServiceTest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void fiftyThreadsOneRollLeftExactlyOneSucceeds() throws Exception {
         UUID cmId = newCmWithQuota(1, 0); // exactly one roll available
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
-
         int threadCount = 50;
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-        CountDownLatch readyLatch = new CountDownLatch(threadCount);
-        CountDownLatch startGate = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(threadCount);
-        AtomicInteger trueCount = new AtomicInteger();
-        AtomicInteger falseCount = new AtomicInteger();
-        Queue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
 
-        for (int i = 0; i < threadCount; i++) {
-            pool.submit(() -> {
-                try {
-                    readyLatch.countDown();
-                    startGate.await(); // true simultaneous release, not a trickle
-                    boolean claimed = service.claimRoll(cmId);
-                    if (claimed) {
-                        trueCount.incrementAndGet();
-                    } else {
-                        falseCount.incrementAndGet();
+        try (HikariDataSource hikariDs = prewarmedHikariDataSource(threadCount)) {
+            AccountQuotaService service = new AccountQuotaService(hikariDs, new SimpleMeterRegistry());
+
+            ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+            CountDownLatch readyLatch = new CountDownLatch(threadCount);
+            CountDownLatch startGate = new CountDownLatch(1);
+            CountDownLatch doneLatch = new CountDownLatch(threadCount);
+            AtomicInteger trueCount = new AtomicInteger();
+            AtomicInteger falseCount = new AtomicInteger();
+            Queue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+
+            for (int i = 0; i < threadCount; i++) {
+                pool.submit(() -> {
+                    try {
+                        readyLatch.countDown();
+                        startGate.await(); // true simultaneous release, not a trickle
+                        boolean claimed = service.claimRoll(cmId);
+                        if (claimed) {
+                            trueCount.incrementAndGet();
+                        } else {
+                            falseCount.incrementAndGet();
+                        }
                     }
-                }
-                catch (Throwable t) {
-                    unexpected.add(t);
-                }
-                finally {
-                    doneLatch.countDown();
-                }
-            });
+                    catch (Throwable t) {
+                        unexpected.add(t);
+                    }
+                    finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+
+            readyLatch.await();
+            startGate.countDown();
+            doneLatch.await();
+            pool.shutdownNow();
+
+            assertThat(unexpected).as("no unexpected exception from any thread").isEmpty();
+            assertThat(trueCount.get()).as("exactly one thread claims the last roll").isEqualTo(1);
+            assertThat(falseCount.get()).as("the other 49 are rejected cleanly").isEqualTo(49);
+            assertThat(rollsUsed(cmId)).as("rolls_used ends exactly at rolls_allocated, never past it").isEqualTo(1);
         }
-
-        readyLatch.await();
-        startGate.countDown();
-        doneLatch.await();
-        pool.shutdownNow();
-
-        assertThat(unexpected).as("no unexpected exception from any thread").isEmpty();
-        assertThat(trueCount.get()).as("exactly one thread claims the last roll").isEqualTo(1);
-        assertThat(falseCount.get()).as("the other 49 are rejected cleanly").isEqualTo(49);
-        assertThat(rollsUsed(cmId)).as("rolls_used ends exactly at rolls_allocated, never past it").isEqualTo(1);
     }
 
     // ---- Test 4: claim-and-refund interleave, looped 20x by the caller of this test class ----
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void claimAndRefundInterleaveNeverLeavesAnInvalidValue() throws Exception {
-        UUID cmId = newCmWithQuota(10, 0);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
-
+        UUID cmId = newCmWithQuota(10, 5); // rolls_allocated=10, rolls_used=5
         int threadCount = 20;
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-        CountDownLatch readyLatch = new CountDownLatch(threadCount);
-        CountDownLatch startGate = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(threadCount);
-        Queue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
 
-        for (int i = 0; i < threadCount; i++) {
-            boolean claim = i % 2 == 0;
-            pool.submit(() -> {
-                try {
-                    readyLatch.countDown();
-                    startGate.await();
-                    if (claim) {
-                        service.claimRoll(cmId);
+        try (HikariDataSource hikariDs = prewarmedHikariDataSource(threadCount)) {
+            AccountQuotaService service = new AccountQuotaService(hikariDs, new SimpleMeterRegistry());
+
+            ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+            CountDownLatch readyLatch = new CountDownLatch(threadCount);
+            CountDownLatch startGate = new CountDownLatch(1);
+            CountDownLatch doneLatch = new CountDownLatch(threadCount);
+            AtomicInteger successfulClaims = new AtomicInteger();
+            AtomicInteger successfulRefunds = new AtomicInteger();
+            Queue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+
+            for (int i = 0; i < threadCount; i++) {
+                boolean claim = i % 2 == 0;
+                pool.submit(() -> {
+                    try {
+                        readyLatch.countDown();
+                        startGate.await();
+                        if (claim) {
+                            if (service.claimRoll(cmId)) {
+                                successfulClaims.incrementAndGet();
+                            }
+                        }
+                        else {
+                            if (service.refundRoll(cmId)) {
+                                successfulRefunds.incrementAndGet();
+                            }
+                        }
                     }
-                    else {
-                        service.refundRoll(cmId);
+                    catch (Throwable t) {
+                        unexpected.add(t);
                     }
-                }
-                catch (Throwable t) {
-                    unexpected.add(t);
-                }
-                finally {
-                    doneLatch.countDown();
-                }
-            });
+                    finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+
+            readyLatch.await();
+            startGate.countDown();
+            boolean finishedInTime = doneLatch.await(20, TimeUnit.SECONDS);
+            pool.shutdownNow();
+
+            assertThat(finishedInTime).as("no deadlock between claim and refund on the same row").isTrue();
+            assertThat(unexpected).as("no unexpected exception from any thread").isEmpty();
+            int finalUsed = rollsUsed(cmId);
+            assertThat(finalUsed).as("rolls_used stays within bounds throughout").isBetween(0, 10);
+            assertThat(finalUsed)
+                    .as("final value must reconcile exactly against every successful operation, "
+                            + "not just stay in bounds -- 5 (starting) + successfulClaims - successfulRefunds")
+                    .isEqualTo(5 + successfulClaims.get() - successfulRefunds.get());
         }
-
-        readyLatch.await();
-        startGate.countDown();
-        boolean finishedInTime = doneLatch.await(20, TimeUnit.SECONDS);
-        pool.shutdownNow();
-
-        assertThat(finishedInTime).as("no deadlock between claim and refund on the same row").isTrue();
-        assertThat(unexpected).as("no unexpected exception from any thread").isEmpty();
-        int finalUsed = rollsUsed(cmId);
-        assertThat(finalUsed).as("rolls_used stays within bounds throughout").isBetween(0, 10);
     }
 
     // ---- Test 5 ----
     @Test
     void refundRollSucceedsAndDecrementsRollsUsedByExactlyOne() throws Exception {
         UUID cmId = newCmWithQuota(5, 3);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         boolean result = service.refundRoll(cmId);
 
@@ -383,7 +434,7 @@ class AccountQuotaServiceTest {
     @Test
     void refundRollOverRefundReturnsFalseWithNoException() throws Exception {
         UUID cmId = newCmWithQuota(5, 0); // nothing to refund
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         boolean result = service.refundRoll(cmId);
 
@@ -426,7 +477,7 @@ class AccountQuotaServiceTest {
         }
 
         try {
-            AccountQuotaService service = new AccountQuotaService(timeoutBoundedDataSource(2000));
+            AccountQuotaService service = new AccountQuotaService(timeoutBoundedDataSource(2000), new SimpleMeterRegistry());
 
             long start = System.nanoTime();
             assertThrows(IllegalStateException.class, () -> service.claimRoll(cmId));
@@ -440,6 +491,64 @@ class AccountQuotaServiceTest {
             lockHolder.rollback();
             lockHolder.close();
         }
+    }
+
+    // ---- Post-review: AccountQuotaService must join the caller's transaction ----
+    // Each DataSource here opens a brand-new physical connection per getConnection() call (see
+    // simpleDataSource()'s own Javadoc), with no awareness of Spring's transaction
+    // synchronization -- so if AccountQuotaService still called dataSource.getConnection()
+    // directly, its write would land on a DIFFERENT connection than the one
+    // DataSourceTransactionManager/TransactionTemplate is managing, auto-commit on that
+    // separate connection, and survive the outer rollback. These three tests prove it does not.
+    @Test
+    void claimRollParticipatesInCallersTransactionAndRollsBackCleanly() throws Exception {
+        UUID cmId = newCmWithQuota(5, 2);
+        DataSource ds = simpleDataSource();
+        DataSourceTransactionManager txManager = new DataSourceTransactionManager(ds);
+        TransactionTemplate txTemplate = new TransactionTemplate(txManager);
+        AccountQuotaService service = new AccountQuotaService(ds, new SimpleMeterRegistry());
+
+        txTemplate.execute(status -> {
+            service.claimRoll(cmId);
+            status.setRollbackOnly();
+            return null;
+        });
+
+        assertThat(rollsUsed(cmId)).as("rolled back -- claimRoll's write must not survive").isEqualTo(2);
+    }
+
+    @Test
+    void refundRollParticipatesInCallersTransactionAndRollsBackCleanly() throws Exception {
+        UUID cmId = newCmWithQuota(5, 3);
+        DataSource ds = simpleDataSource();
+        DataSourceTransactionManager txManager = new DataSourceTransactionManager(ds);
+        TransactionTemplate txTemplate = new TransactionTemplate(txManager);
+        AccountQuotaService service = new AccountQuotaService(ds, new SimpleMeterRegistry());
+
+        txTemplate.execute(status -> {
+            service.refundRoll(cmId);
+            status.setRollbackOnly();
+            return null;
+        });
+
+        assertThat(rollsUsed(cmId)).as("rolled back -- refundRoll's write must not survive").isEqualTo(3);
+    }
+
+    @Test
+    void addRollsParticipatesInCallersTransactionAndRollsBackCleanly() throws Exception {
+        UUID cmId = newCmWithQuota(5, 2);
+        DataSource ds = simpleDataSource();
+        DataSourceTransactionManager txManager = new DataSourceTransactionManager(ds);
+        TransactionTemplate txTemplate = new TransactionTemplate(txManager);
+        AccountQuotaService service = new AccountQuotaService(ds, new SimpleMeterRegistry());
+
+        txTemplate.execute(status -> {
+            service.addRolls(cmId, 7);
+            status.setRollbackOnly();
+            return null;
+        });
+
+        assertThat(rollsAllocated(cmId)).as("rolled back -- addRolls's write must not survive").isEqualTo(5);
     }
 
     // ---- Test 8: missing account_quota row disambiguation ----
@@ -528,7 +637,7 @@ class AccountQuotaServiceTest {
     @Test
     void claimAndRefundSuccessEachLogOneInfoLine(CapturedOutput output) throws Exception {
         UUID cmId = newCmWithQuota(5, 0);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         service.claimRoll(cmId);
         assertThat(output.getAll()).contains("outcome=claimed");
@@ -542,7 +651,7 @@ class AccountQuotaServiceTest {
     @Test
     void noSecretOrPersonalDataInAnyLogLine(CapturedOutput output) throws Exception {
         UUID cmId = newCmWithQuota(5, 2);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         service.claimRoll(cmId);
         service.refundRoll(cmId);
@@ -555,7 +664,7 @@ class AccountQuotaServiceTest {
     @Test
     void addRollsSucceedsAndIncrementsRollsAllocatedByExactlyTheGivenAmount() throws Exception {
         UUID cmId = newCmWithQuota(5, 2);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         service.addRolls(cmId, 8);
 
@@ -566,7 +675,7 @@ class AccountQuotaServiceTest {
     @Test
     void addRollsRejectsNonPositiveAmountBeforeAnySql() throws Exception {
         UUID cmId = newCmWithQuota(5, 2);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         assertThrows(IllegalArgumentException.class, () -> service.addRolls(cmId, 0));
         assertThrows(IllegalArgumentException.class, () -> service.addRolls(cmId, -1));
@@ -598,7 +707,7 @@ class AccountQuotaServiceTest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void addRollsConcurrencyNeverLosesAnUpdate() throws Exception {
         UUID cmId = newCmWithQuota(0, 0);
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), new SimpleMeterRegistry());
 
         int threadCount = 50;
         List<Integer> amounts = IntStream.range(0, threadCount).mapToObj(i -> (i % 5) + 1).toList();
