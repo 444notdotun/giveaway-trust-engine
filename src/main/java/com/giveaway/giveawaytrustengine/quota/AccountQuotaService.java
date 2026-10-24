@@ -1,0 +1,192 @@
+package com.giveaway.giveawaytrustengine.quota;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.datasource.DataSourceUtils;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.UUID;
+
+/**
+ * Slice 4 (Quota) -- CRITICAL REVIEW. See docs/slices/04-quota.md.
+ *
+ * <p><b>{@code claimRoll} and {@code refundRoll} are each one conditional {@code UPDATE}</b> --
+ * never a read in Java followed by a write (CLAUDE.md: "money and quota math happens in SQL,
+ * never read then write in Java") -- so Postgres's own row-level locking is what actually
+ * serializes concurrent callers, not application logic. The `account_quota` table's own CHECK
+ * constraints ({@code rolls_used >= 0}, {@code rolls_used <= rolls_allocated}) are the backstop
+ * if either guard is ever removed by a future regression; they are not meant to fire in normal
+ * operation.
+ *
+ * <p><b>{@code refundRoll}'s guard only prevents a negative value -- it does not, and cannot,
+ * detect a double refund.</b> A second refund of an already-refunded claim looks identical, at
+ * the database level, to any other legitimate refund. Closing that gap is an explicit
+ * requirement on whoever calls this (slice 5): refund exactly once per failed giveaway, in the
+ * same transaction as the giveaway's own state change.
+ *
+ * <p><b>Every method joins the caller's existing transaction, if there is one.</b> Connections
+ * are obtained via {@link DataSourceUtils#getConnection} and released via {@link
+ * DataSourceUtils#releaseConnection}, not {@code dataSource.getConnection()}/{@code
+ * connection.close()} directly -- the latter would always open a brand-new physical connection
+ * and auto-commit on it immediately, completely bypassing any Spring-managed transaction a
+ * caller (slice 5) has already started, so a rollback of the caller's transaction would never
+ * undo a claim or refund this service already committed on its own, separate connection. With
+ * no active transaction, {@code DataSourceUtils} behaves exactly like calling the plain
+ * {@code DataSource} methods directly -- existing non-transactional callers are unaffected.
+ */
+public class AccountQuotaService {
+
+    private static final Logger log = LoggerFactory.getLogger(AccountQuotaService.class);
+
+    private static final String FAILURE_COUNTER_NAME = "giveaway.quota.failure";
+
+    private final DataSource dataSource;
+    private final MeterRegistry meterRegistry;
+
+    public AccountQuotaService(DataSource dataSource, MeterRegistry meterRegistry) {
+        this.dataSource = dataSource;
+        this.meterRegistry = meterRegistry;
+    }
+
+    /**
+     * Claims one roll via {@code UPDATE account_quota SET rolls_used = rolls_used + 1 WHERE
+     * cm_id = ? AND rolls_used < rolls_allocated}. Returns {@code false} when no roll is left --
+     * the caller maps that to HTTP 402 (slice 5). Never throws for a clean "no roll left"
+     * rejection; only for a genuine DB failure or a missing {@code account_quota} row.
+     */
+    public boolean claimRoll(UUID cmId) {
+        Connection conn = DataSourceUtils.getConnection(dataSource);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE account_quota SET rolls_used = rolls_used + 1 "
+                        + "WHERE cm_id = ? AND rolls_used < rolls_allocated")) {
+            ps.setObject(1, cmId);
+            int updated = ps.executeUpdate();
+            if (updated == 1) {
+                log.info("quota claim: cmId={} outcome=claimed", cmId);
+                return true;
+            }
+            requireAccountQuotaRowExists(conn, cmId); // throws (with its own WARN+counter) if the row is missing
+            log.info("quota claim rejected: cmId={} reason=exhausted", cmId);
+            meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "exhausted").increment();
+            return false;
+        }
+        catch (SQLException e) {
+            recordDbFailure();
+            throw new IllegalStateException("failed to claim roll", e);
+        }
+        finally {
+            DataSourceUtils.releaseConnection(conn, dataSource);
+        }
+    }
+
+    /**
+     * Refunds one roll via {@code UPDATE account_quota SET rolls_used = rolls_used - 1 WHERE
+     * cm_id = ? AND rolls_used > 0}. Returns {@code false} on an over-refund (including a double
+     * refund of the same claim) -- the guard only stops a negative value, it does not detect or
+     * prevent a double refund; see the class Javadoc.
+     */
+    public boolean refundRoll(UUID cmId) {
+        Connection conn = DataSourceUtils.getConnection(dataSource);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE account_quota SET rolls_used = rolls_used - 1 "
+                        + "WHERE cm_id = ? AND rolls_used > 0")) {
+            ps.setObject(1, cmId);
+            int updated = ps.executeUpdate();
+            if (updated == 1) {
+                log.info("quota refund: cmId={} outcome=refunded", cmId);
+                return true;
+            }
+            requireAccountQuotaRowExists(conn, cmId); // throws (with its own WARN+counter) if the row is missing
+            // The guard legitimately tripped (rolls_used was already 0) -- this is the ONE path
+            // a double refund would ever show up on (reviewer finding 1), so it must leave a
+            // trace even though it is not itself proof of a double refund (see class Javadoc).
+            log.warn("quota refund rejected: cmId={} reason=refund-noop", cmId);
+            meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "refund-noop").increment();
+            return false;
+        }
+        catch (SQLException e) {
+            recordDbFailure();
+            throw new IllegalStateException("failed to refund roll", e);
+        }
+        finally {
+            DataSourceUtils.releaseConnection(conn, dataSource);
+        }
+    }
+
+    /**
+     * Credits {@code amount} additional rolls via {@code UPDATE account_quota SET
+     * rolls_allocated = rolls_allocated + ? WHERE cm_id = ?}. Called by the Bachs webhook
+     * (slice 10) on a successful payment event; {@code payment_event}'s own {@code (provider,
+     * event_id)} unique constraint (slice 1) is what stops a redelivered webhook from reaching
+     * this twice for the same event, not anything in this method.
+     *
+     * @throws IllegalArgumentException if {@code amount} is zero or negative -- rejected before
+     *         any SQL is issued.
+     */
+    public void addRolls(UUID cmId, int amount) {
+        if (amount <= 0) {
+            throw new IllegalArgumentException("amount must be positive, got " + amount);
+        }
+        Connection conn = DataSourceUtils.getConnection(dataSource);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE account_quota SET rolls_allocated = rolls_allocated + ? WHERE cm_id = ?")) {
+            ps.setInt(1, amount);
+            ps.setObject(2, cmId);
+            int updated = ps.executeUpdate();
+            if (updated == 0) {
+                // Unlike claimRoll/refundRoll, there is no guard condition to disambiguate from
+                // here -- the only WHERE clause is the cmId match itself, so zero rows can only
+                // mean one thing.
+                recordMissingQuotaRow(cmId);
+                throw new IllegalStateException("no account_quota row for cmId=" + cmId);
+            }
+        }
+        catch (SQLException e) {
+            recordDbFailure();
+            throw new IllegalStateException("failed to add rolls", e);
+        }
+        finally {
+            DataSourceUtils.releaseConnection(conn, dataSource);
+        }
+    }
+
+    /**
+     * Disambiguates a zero-rows result from {@code claimRoll}/{@code refundRoll}: did the guard
+     * legitimately trip (the row exists, just not in the required state), or does the {@code
+     * account_quota} row not exist at all (a data-integrity bug that should structurally never
+     * happen, per {@code CommunityManagerRepository}'s 1:1 creation guarantee)? Run only on the
+     * zero-rows path -- the happy path never issues this extra query.
+     */
+    private void requireAccountQuotaRowExists(Connection conn, UUID cmId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM account_quota WHERE cm_id = ?")) {
+            ps.setObject(1, cmId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    recordMissingQuotaRow(cmId);
+                    throw new IllegalStateException("no account_quota row for cmId=" + cmId);
+                }
+            }
+        }
+    }
+
+    /**
+     * Reviewer finding 2: this is the single most serious failure class this slice defines --
+     * "a genuine data-integrity bug" (docs/slices/04-quota.md, Section 4, test 8) -- so it must
+     * log and count BEFORE the caller throws, never fail silently.
+     */
+    private void recordMissingQuotaRow(UUID cmId) {
+        log.warn("quota operation rejected: cmId={} reason=missing-quota-row", cmId);
+        meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "missing-quota-row").increment();
+    }
+
+    /** Never logs SQL text or any value beyond the fixed reason category. */
+    private void recordDbFailure() {
+        log.warn("quota operation rejected: reason=db-unavailable");
+        meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "db-unavailable").increment();
+    }
+}

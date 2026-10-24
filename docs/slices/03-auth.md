@@ -1,5 +1,18 @@
 # Slice 3: Auth
 
+## Status
+
+**Deployed to staging, verified live:** login through X, callback, `community_manager` upsert, `account_quota` row, session cookies.
+
+**Refresh rotation and replay revocation are covered by Testcontainers tests only** — not yet exercised live.
+
+**Accepted risks:**
+- Redis epoch cut (Section 4a): Redis data loss can restore a revoked family until the access token expires.
+- `statement_timeout` is unverified against the Supabase session pooler.
+- No rate limiting on `/auth/login` and `/auth/callback`.
+- Expired `refresh_token` rows are never cleaned up.
+- `email` from X is not collected.
+
 CRITICAL REVIEW, scoped to **reuse detection and revocation ordering** (Section 4 below) — the exact sequencing of "mark the token used" vs. "revoke the family" vs. "write to Redis" is where a race or an ordering mistake turns into a silently-not-actually-revoked session. PRD refs: Section 9 (Permissions & Security — JWT, refresh tokens, revocation), Section 3 (RefreshToken domain object), Section 15 (resolve endpoint check order). BUILD_ORDER item 3.
 
 **PRD tension — approved by the PM on 2026-10-22.** Section 11 ("Integrations") states "There is no direct integration with X's own API anywhere in this system." Read in context, Section 11 is specifically about the giveaway pipeline's data-collection integrations (replies/retweets/follow-checker, all routed through Apify) — Section 9 already separately specifies cookie/JWT auth with no mention of Apify for login, so this slice reads Section 11's statement as scoped to the pipeline, not to authentication. The PRD itself needed an edit to say so explicitly: a carve-out for Section 11 (OAuth sign-in is the one direct X API usage — a token exchange plus one `GET /2/users/me` call, both scopes `users.read`/`tweet.read` required by that one endpoint, `tweet.read` granted but never used to read a tweet, X's own tokens discarded immediately and never stored, no other endpoint and no pipeline data ever touched this way), plus the login mechanism itself written into Section 9 and Section 3 (previously entirely unstated there). **Exact replacement text for all three is in "PRD edits to apply" at the end of this doc** — Adedotun applies it to the PRD directly; this slice doc does not edit `docs/PRD.md`. A second, separate PRD wording gap surfaced in Section 0 below (the `email` field's nullability) is **not** covered by this approval and still needs its own sign-off.

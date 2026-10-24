@@ -1,6 +1,8 @@
 package com.giveaway.giveawaytrustengine.auth;
 
 import com.giveaway.giveawaytrustengine.GiveawayTrustEngineApplication;
+import com.giveaway.giveawaytrustengine.quota.AccountQuotaService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.WebApplicationType;
@@ -19,13 +21,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Chunk 4 review (second round), item 4: {@link AuthBeanAvailabilityGuard} must fail startup,
  * naming the specific missing bean, if {@link RevocationChecker}, {@link OAuthStateService},
- * {@link CommunityManagerRepository}, or {@link RefreshTokenService} resolves to {@code null} in
- * a real deployment -- but must NOT fire in a context that deliberately excludes Redis/DataSource
- * autoconfiguration (the existing pattern several test classes already use to boot a
- * Redis/DB-less context on purpose).
+ * {@link CommunityManagerRepository}, {@link RefreshTokenService}, or {@link AccountQuotaService}
+ * resolves to {@code null} in a real deployment -- but must NOT fire in a context that
+ * deliberately excludes Redis/DataSource autoconfiguration (the existing pattern several test
+ * classes already use to boot a Redis/DB-less context on purpose).
+ *
+ * {@link AccountQuotaService} (slice 4, post-review item 5) was added to this guard's scope
+ * alongside the four slice 3 beans -- it depends only on the {@code DataSource}, same category
+ * as {@link CommunityManagerRepository}/{@link RefreshTokenService}.
  *
  * The unit-level tests below use {@link ApplicationContextRunner} with hand-built configurations
- * (same isolation pattern as {@code StartupGuardTest}), registering ONE of the four beans as a
+ * (same isolation pattern as {@code StartupGuardTest}), registering ONE of the five beans as a
  * direct {@code null} to simulate exactly the failure this guard exists to catch, without needing
  * a real Redis/DataSource outage to reproduce it.
  */
@@ -47,6 +53,10 @@ class AuthBeanAvailabilityGuardTest {
         return new RefreshTokenService(null, Clock.systemUTC(), dummyRevocationChecker(), null);
     }
 
+    private static AccountQuotaService dummyAccountQuotaService() {
+        return new AccountQuotaService(null, new SimpleMeterRegistry());
+    }
+
     private static Throwable rootCause(AssertableApplicationContext context) {
         Throwable failure = context.getStartupFailure();
         assertThat(failure).as("expected a startup failure but context did not fail").isNotNull();
@@ -58,7 +68,7 @@ class AuthBeanAvailabilityGuardTest {
     }
 
     @Configuration
-    static class AllFourPresentExceptRevocationChecker {
+    static class AllFivePresentExceptRevocationChecker {
         @Bean
         RevocationChecker revocationChecker() {
             return null;
@@ -80,19 +90,25 @@ class AuthBeanAvailabilityGuardTest {
         }
 
         @Bean
+        AccountQuotaService accountQuotaService() {
+            return dummyAccountQuotaService();
+        }
+
+        @Bean
         AuthBeanAvailabilityGuard guard(ObjectProvider<RevocationChecker> revocationChecker,
                 ObjectProvider<OAuthStateService> oauthStateService,
                 ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-                ObjectProvider<RefreshTokenService> refreshTokenService) {
-            return new AuthBeanAvailabilityGuard(
-                    revocationChecker, oauthStateService, communityManagerRepository, refreshTokenService);
+                ObjectProvider<RefreshTokenService> refreshTokenService,
+                ObjectProvider<AccountQuotaService> accountQuotaService) {
+            return new AuthBeanAvailabilityGuard(revocationChecker, oauthStateService,
+                    communityManagerRepository, refreshTokenService, accountQuotaService);
         }
     }
 
     @Test
     void nullRevocationCheckerFailsStartupNamingIt() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptRevocationChecker.class)
+                .withUserConfiguration(AllFivePresentExceptRevocationChecker.class)
                 .run(context -> {
                     assertThat(context).hasFailed();
                     Throwable root = rootCause(context);
@@ -102,7 +118,7 @@ class AuthBeanAvailabilityGuardTest {
     }
 
     @Configuration
-    static class AllFourPresentExceptOauthStateService {
+    static class AllFivePresentExceptOauthStateService {
         @Bean
         RevocationChecker revocationChecker() {
             return dummyRevocationChecker();
@@ -124,19 +140,25 @@ class AuthBeanAvailabilityGuardTest {
         }
 
         @Bean
+        AccountQuotaService accountQuotaService() {
+            return dummyAccountQuotaService();
+        }
+
+        @Bean
         AuthBeanAvailabilityGuard guard(ObjectProvider<RevocationChecker> revocationChecker,
                 ObjectProvider<OAuthStateService> oauthStateService,
                 ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-                ObjectProvider<RefreshTokenService> refreshTokenService) {
-            return new AuthBeanAvailabilityGuard(
-                    revocationChecker, oauthStateService, communityManagerRepository, refreshTokenService);
+                ObjectProvider<RefreshTokenService> refreshTokenService,
+                ObjectProvider<AccountQuotaService> accountQuotaService) {
+            return new AuthBeanAvailabilityGuard(revocationChecker, oauthStateService,
+                    communityManagerRepository, refreshTokenService, accountQuotaService);
         }
     }
 
     @Test
     void nullOauthStateServiceFailsStartupNamingIt() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptOauthStateService.class)
+                .withUserConfiguration(AllFivePresentExceptOauthStateService.class)
                 .run(context -> {
                     assertThat(context).hasFailed();
                     Throwable root = rootCause(context);
@@ -146,7 +168,7 @@ class AuthBeanAvailabilityGuardTest {
     }
 
     @Configuration
-    static class AllFourPresentExceptCommunityManagerRepository {
+    static class AllFivePresentExceptCommunityManagerRepository {
         @Bean
         RevocationChecker revocationChecker() {
             return dummyRevocationChecker();
@@ -168,19 +190,25 @@ class AuthBeanAvailabilityGuardTest {
         }
 
         @Bean
+        AccountQuotaService accountQuotaService() {
+            return dummyAccountQuotaService();
+        }
+
+        @Bean
         AuthBeanAvailabilityGuard guard(ObjectProvider<RevocationChecker> revocationChecker,
                 ObjectProvider<OAuthStateService> oauthStateService,
                 ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-                ObjectProvider<RefreshTokenService> refreshTokenService) {
-            return new AuthBeanAvailabilityGuard(
-                    revocationChecker, oauthStateService, communityManagerRepository, refreshTokenService);
+                ObjectProvider<RefreshTokenService> refreshTokenService,
+                ObjectProvider<AccountQuotaService> accountQuotaService) {
+            return new AuthBeanAvailabilityGuard(revocationChecker, oauthStateService,
+                    communityManagerRepository, refreshTokenService, accountQuotaService);
         }
     }
 
     @Test
     void nullCommunityManagerRepositoryFailsStartupNamingIt() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withUserConfiguration(AllFivePresentExceptCommunityManagerRepository.class)
                 .run(context -> {
                     assertThat(context).hasFailed();
                     Throwable root = rootCause(context);
@@ -190,7 +218,7 @@ class AuthBeanAvailabilityGuardTest {
     }
 
     @Configuration
-    static class AllFourPresentExceptRefreshTokenService {
+    static class AllFivePresentExceptRefreshTokenService {
         @Bean
         RevocationChecker revocationChecker() {
             return dummyRevocationChecker();
@@ -212,19 +240,25 @@ class AuthBeanAvailabilityGuardTest {
         }
 
         @Bean
+        AccountQuotaService accountQuotaService() {
+            return dummyAccountQuotaService();
+        }
+
+        @Bean
         AuthBeanAvailabilityGuard guard(ObjectProvider<RevocationChecker> revocationChecker,
                 ObjectProvider<OAuthStateService> oauthStateService,
                 ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-                ObjectProvider<RefreshTokenService> refreshTokenService) {
-            return new AuthBeanAvailabilityGuard(
-                    revocationChecker, oauthStateService, communityManagerRepository, refreshTokenService);
+                ObjectProvider<RefreshTokenService> refreshTokenService,
+                ObjectProvider<AccountQuotaService> accountQuotaService) {
+            return new AuthBeanAvailabilityGuard(revocationChecker, oauthStateService,
+                    communityManagerRepository, refreshTokenService, accountQuotaService);
         }
     }
 
     @Test
     void nullRefreshTokenServiceFailsStartupNamingIt() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptRefreshTokenService.class)
+                .withUserConfiguration(AllFivePresentExceptRefreshTokenService.class)
                 .run(context -> {
                     assertThat(context).hasFailed();
                     Throwable root = rootCause(context);
@@ -233,8 +267,9 @@ class AuthBeanAvailabilityGuardTest {
                 });
     }
 
+    // ---- Post-review item 5: AccountQuotaService joins this guard's scope ----
     @Configuration
-    static class AllFourPresent {
+    static class AllFivePresentExceptAccountQuotaService {
         @Bean
         RevocationChecker revocationChecker() {
             return dummyRevocationChecker();
@@ -256,12 +291,77 @@ class AuthBeanAvailabilityGuardTest {
         }
 
         @Bean
+        AccountQuotaService accountQuotaService() {
+            return null;
+        }
+
+        @Bean
         AuthBeanAvailabilityGuard guard(ObjectProvider<RevocationChecker> revocationChecker,
                 ObjectProvider<OAuthStateService> oauthStateService,
                 ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-                ObjectProvider<RefreshTokenService> refreshTokenService) {
-            return new AuthBeanAvailabilityGuard(
-                    revocationChecker, oauthStateService, communityManagerRepository, refreshTokenService);
+                ObjectProvider<RefreshTokenService> refreshTokenService,
+                ObjectProvider<AccountQuotaService> accountQuotaService) {
+            return new AuthBeanAvailabilityGuard(revocationChecker, oauthStateService,
+                    communityManagerRepository, refreshTokenService, accountQuotaService);
+        }
+    }
+
+    @Test
+    void nullAccountQuotaServiceFailsStartupNamingIt() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFivePresentExceptAccountQuotaService.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    Throwable root = rootCause(context);
+                    assertThat(root).isInstanceOf(IllegalStateException.class);
+                    assertThat(root.getMessage()).contains("accountQuotaService");
+                });
+    }
+
+    @Test
+    void accountQuotaServiceNullWithDataSourceExcludedBootsCleanly() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(AllFivePresentExceptAccountQuotaService.class)
+                .withPropertyValues("spring.autoconfigure.exclude="
+                        + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Configuration
+    static class AllFivePresent {
+        @Bean
+        RevocationChecker revocationChecker() {
+            return dummyRevocationChecker();
+        }
+
+        @Bean
+        OAuthStateService oauthStateService() {
+            return dummyOAuthStateService();
+        }
+
+        @Bean
+        CommunityManagerRepository communityManagerRepository() {
+            return dummyCommunityManagerRepository();
+        }
+
+        @Bean
+        RefreshTokenService refreshTokenService() {
+            return dummyRefreshTokenService();
+        }
+
+        @Bean
+        AccountQuotaService accountQuotaService() {
+            return dummyAccountQuotaService();
+        }
+
+        @Bean
+        AuthBeanAvailabilityGuard guard(ObjectProvider<RevocationChecker> revocationChecker,
+                ObjectProvider<OAuthStateService> oauthStateService,
+                ObjectProvider<CommunityManagerRepository> communityManagerRepository,
+                ObjectProvider<RefreshTokenService> refreshTokenService,
+                ObjectProvider<AccountQuotaService> accountQuotaService) {
+            return new AuthBeanAvailabilityGuard(revocationChecker, oauthStateService,
+                    communityManagerRepository, refreshTokenService, accountQuotaService);
         }
     }
 
@@ -271,7 +371,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void oauthStateServiceNullWithOnlyDataSourceExcludedStillFails() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptOauthStateService.class)
+                .withUserConfiguration(AllFivePresentExceptOauthStateService.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
                 .run(context -> {
@@ -285,7 +385,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void oauthStateServiceNullWithRedisExcludedBootsCleanly() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptOauthStateService.class)
+                .withUserConfiguration(AllFivePresentExceptOauthStateService.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration")
                 .run(context -> assertThat(context).hasNotFailed());
@@ -296,7 +396,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void communityManagerRepositoryNullWithOnlyRedisExcludedStillFails() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withUserConfiguration(AllFivePresentExceptCommunityManagerRepository.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration")
                 .run(context -> {
@@ -310,7 +410,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void communityManagerRepositoryNullWithDataSourceExcludedBootsCleanly() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withUserConfiguration(AllFivePresentExceptCommunityManagerRepository.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
                 .run(context -> assertThat(context).hasNotFailed());
@@ -319,7 +419,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void refreshTokenServiceNullWithDataSourceExcludedBootsCleanly() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptRefreshTokenService.class)
+                .withUserConfiguration(AllFivePresentExceptRefreshTokenService.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
                 .run(context -> assertThat(context).hasNotFailed());
@@ -331,7 +431,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void revocationCheckerNullWithOnlyDataSourceExcludedBootsCleanly() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptRevocationChecker.class)
+                .withUserConfiguration(AllFivePresentExceptRevocationChecker.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration")
                 .run(context -> assertThat(context).hasNotFailed());
@@ -340,7 +440,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void revocationCheckerNullWithOnlyRedisExcludedBootsCleanly() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptRevocationChecker.class)
+                .withUserConfiguration(AllFivePresentExceptRevocationChecker.class)
                 .withPropertyValues("spring.autoconfigure.exclude="
                         + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration")
                 .run(context -> assertThat(context).hasNotFailed());
@@ -352,7 +452,7 @@ class AuthBeanAvailabilityGuardTest {
     @Test
     void lookalikeExclusionPropertyDoesNotDisableGuard() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresentExceptCommunityManagerRepository.class)
+                .withUserConfiguration(AllFivePresentExceptCommunityManagerRepository.class)
                 .withPropertyValues("spring.autoconfigure.exclude=com.acme.MyDataSourceAutoConfigurationShim")
                 .run(context -> {
                     assertThat(context).hasFailed();
@@ -363,9 +463,9 @@ class AuthBeanAvailabilityGuardTest {
     }
 
     @Test
-    void allFourPresentBootsCleanly() {
+    void allFivePresentBootsCleanly() {
         new ApplicationContextRunner()
-                .withUserConfiguration(AllFourPresent.class)
+                .withUserConfiguration(AllFivePresent.class)
                 .run(context -> assertThat(context).hasNotFailed());
     }
 
