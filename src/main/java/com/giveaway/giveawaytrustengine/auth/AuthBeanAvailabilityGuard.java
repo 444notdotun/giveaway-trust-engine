@@ -1,5 +1,6 @@
 package com.giveaway.giveawaytrustengine.auth;
 
+import com.giveaway.giveawaytrustengine.quota.AccountQuotaService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -31,6 +32,11 @@ import org.springframework.stereotype.Component;
  * {@code null}: {@link OAuthStateService} depends only on Redis, {@link CommunityManagerRepository}
  * and {@link RefreshTokenService} depend only on the DataSource, and {@link RevocationChecker}
  * depends on both (so either exclusion alone already fully explains a null RevocationChecker).
+ *
+ * <p>Slice 4 (Quota), post-review item 5: {@link AccountQuotaService} joins this guard's scope
+ * -- it depends only on the {@code DataSource}, same category as {@code CommunityManagerRepository}
+ * and {@code RefreshTokenService}, so it is checked under the same {@code dataSourceExcluded}
+ * condition they are.
  */
 @Component
 public class AuthBeanAvailabilityGuard implements SmartInitializingSingleton, EnvironmentAware {
@@ -46,16 +52,19 @@ public class AuthBeanAvailabilityGuard implements SmartInitializingSingleton, En
     private final ObjectProvider<OAuthStateService> oauthStateService;
     private final ObjectProvider<CommunityManagerRepository> communityManagerRepository;
     private final ObjectProvider<RefreshTokenService> refreshTokenService;
+    private final ObjectProvider<AccountQuotaService> accountQuotaService;
     private Environment environment;
 
     public AuthBeanAvailabilityGuard(ObjectProvider<RevocationChecker> revocationChecker,
             ObjectProvider<OAuthStateService> oauthStateService,
             ObjectProvider<CommunityManagerRepository> communityManagerRepository,
-            ObjectProvider<RefreshTokenService> refreshTokenService) {
+            ObjectProvider<RefreshTokenService> refreshTokenService,
+            ObjectProvider<AccountQuotaService> accountQuotaService) {
         this.revocationChecker = revocationChecker;
         this.oauthStateService = oauthStateService;
         this.communityManagerRepository = communityManagerRepository;
         this.refreshTokenService = refreshTokenService;
+        this.accountQuotaService = accountQuotaService;
     }
 
     @Override
@@ -77,6 +86,7 @@ public class AuthBeanAvailabilityGuard implements SmartInitializingSingleton, En
         if (!dataSourceExcluded) {
             requireResolved("communityManagerRepository", communityManagerRepository.getIfAvailable());
             requireResolved("refreshTokenService", refreshTokenService.getIfAvailable());
+            requireResolved("accountQuotaService", accountQuotaService.getIfAvailable());
         }
     }
 
