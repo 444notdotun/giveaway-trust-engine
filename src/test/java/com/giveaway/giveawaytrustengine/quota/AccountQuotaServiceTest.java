@@ -391,6 +391,26 @@ class AccountQuotaServiceTest {
         assertThat(rollsUsed(cmId)).as("never goes negative").isEqualTo(0);
     }
 
+    // Reviewer finding 1: the guard-legitimately-tripped zero-rows path (over-refund, including
+    // a double refund of the same claim) must leave a trace -- WARN + counter -- unlike before,
+    // when it returned false silently with no log and no metric at all.
+    @Test
+    void refundRollNoopLogsWarnAndIncrementsCounter(CapturedOutput output) throws Exception {
+        UUID cmId = newCmWithQuota(5, 0); // nothing to refund
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), meterRegistry);
+
+        boolean result = service.refundRoll(cmId);
+
+        assertThat(result).isFalse();
+        assertThat(output.getAll()).contains("reason=refund-noop");
+        assertThat(output.getAll()).contains("WARN");
+        assertThat(output.getAll()).as("only cmId identifies the row").contains(cmId.toString());
+        assertThat(output.getAll()).as("no raw SQL or row values leaked").doesNotContain("UPDATE account_quota");
+        assertThat(meterRegistry.counter("giveaway.quota.failure", "reason", "refund-noop").count())
+                .isEqualTo(1.0);
+    }
+
     // ---- Test 7: blocked statement fails within the statement_timeout bound ----
     @Test
     @Timeout(value = 15, unit = TimeUnit.SECONDS)
@@ -423,20 +443,38 @@ class AccountQuotaServiceTest {
     }
 
     // ---- Test 8: missing account_quota row disambiguation ----
+    // Reviewer finding 2: this data-integrity failure path must log a WARN and increment a
+    // counter BEFORE throwing -- previously it threw silently, with no trace at all.
     @Test
-    void claimRollOnMissingAccountQuotaRowThrowsClearException() throws Exception {
+    void claimRollOnMissingAccountQuotaRowThrowsClearException(CapturedOutput output) throws Exception {
         UUID cmId = newCmWithNoQuotaRow();
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), meterRegistry);
 
         assertThrows(IllegalStateException.class, () -> service.claimRoll(cmId));
+
+        assertThat(output.getAll()).contains("reason=missing-quota-row");
+        assertThat(output.getAll()).contains("WARN");
+        assertThat(output.getAll()).as("only cmId identifies the row").contains(cmId.toString());
+        assertThat(output.getAll()).as("no raw SQL or row values leaked").doesNotContain("UPDATE account_quota");
+        assertThat(meterRegistry.counter("giveaway.quota.failure", "reason", "missing-quota-row").count())
+                .isEqualTo(1.0);
     }
 
     @Test
-    void refundRollOnMissingAccountQuotaRowThrowsClearException() throws Exception {
+    void refundRollOnMissingAccountQuotaRowThrowsClearException(CapturedOutput output) throws Exception {
         UUID cmId = newCmWithNoQuotaRow();
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), meterRegistry);
 
         assertThrows(IllegalStateException.class, () -> service.refundRoll(cmId));
+
+        assertThat(output.getAll()).contains("reason=missing-quota-row");
+        assertThat(output.getAll()).contains("WARN");
+        assertThat(output.getAll()).as("only cmId identifies the row").contains(cmId.toString());
+        assertThat(output.getAll()).as("no raw SQL or row values leaked").doesNotContain("UPDATE account_quota");
+        assertThat(meterRegistry.counter("giveaway.quota.failure", "reason", "missing-quota-row").count())
+                .isEqualTo(1.0);
     }
 
     // ---- Test 9: observability, failure paths ----
@@ -537,12 +575,22 @@ class AccountQuotaServiceTest {
     }
 
     // ---- Test 15 ----
+    // Reviewer finding 2: this data-integrity failure path must log a WARN and increment a
+    // counter BEFORE throwing -- previously it threw silently, with no trace at all.
     @Test
-    void addRollsOnMissingCmIdThrowsClearExceptionDirectly() throws Exception {
+    void addRollsOnMissingCmIdThrowsClearExceptionDirectly(CapturedOutput output) throws Exception {
         UUID cmId = newCmWithNoQuotaRow();
-        AccountQuotaService service = new AccountQuotaService(simpleDataSource());
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        AccountQuotaService service = new AccountQuotaService(simpleDataSource(), meterRegistry);
 
         assertThrows(IllegalStateException.class, () -> service.addRolls(cmId, 5));
+
+        assertThat(output.getAll()).contains("reason=missing-quota-row");
+        assertThat(output.getAll()).contains("WARN");
+        assertThat(output.getAll()).as("only cmId identifies the row").contains(cmId.toString());
+        assertThat(output.getAll()).as("no raw SQL or row values leaked").doesNotContain("UPDATE account_quota");
+        assertThat(meterRegistry.counter("giveaway.quota.failure", "reason", "missing-quota-row").count())
+                .isEqualTo(1.0);
     }
 
     // ---- Test 16: addRolls concurrency ----

@@ -64,7 +64,7 @@ public class AccountQuotaService {
                 log.info("quota claim: cmId={} outcome=claimed", cmId);
                 return true;
             }
-            requireAccountQuotaRowExists(conn, cmId);
+            requireAccountQuotaRowExists(conn, cmId); // throws (with its own WARN+counter) if the row is missing
             log.info("quota claim rejected: cmId={} reason=exhausted", cmId);
             meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "exhausted").increment();
             return false;
@@ -92,7 +92,12 @@ public class AccountQuotaService {
                 log.info("quota refund: cmId={} outcome=refunded", cmId);
                 return true;
             }
-            requireAccountQuotaRowExists(conn, cmId);
+            requireAccountQuotaRowExists(conn, cmId); // throws (with its own WARN+counter) if the row is missing
+            // The guard legitimately tripped (rolls_used was already 0) -- this is the ONE path
+            // a double refund would ever show up on (reviewer finding 1), so it must leave a
+            // trace even though it is not itself proof of a double refund (see class Javadoc).
+            log.warn("quota refund rejected: cmId={} reason=refund-noop", cmId);
+            meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "refund-noop").increment();
             return false;
         }
         catch (SQLException e) {
@@ -125,6 +130,7 @@ public class AccountQuotaService {
                 // Unlike claimRoll/refundRoll, there is no guard condition to disambiguate from
                 // here -- the only WHERE clause is the cmId match itself, so zero rows can only
                 // mean one thing.
+                recordMissingQuotaRow(cmId);
                 throw new IllegalStateException("no account_quota row for cmId=" + cmId);
             }
         }
@@ -146,10 +152,21 @@ public class AccountQuotaService {
             ps.setObject(1, cmId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
+                    recordMissingQuotaRow(cmId);
                     throw new IllegalStateException("no account_quota row for cmId=" + cmId);
                 }
             }
         }
+    }
+
+    /**
+     * Reviewer finding 2: this is the single most serious failure class this slice defines --
+     * "a genuine data-integrity bug" (docs/slices/04-quota.md, Section 4, test 8) -- so it must
+     * log and count BEFORE the caller throws, never fail silently.
+     */
+    private void recordMissingQuotaRow(UUID cmId) {
+        log.warn("quota operation rejected: cmId={} reason=missing-quota-row", cmId);
+        meterRegistry.counter(FAILURE_COUNTER_NAME, "reason", "missing-quota-row").increment();
     }
 
     /** Never logs SQL text or any value beyond the fixed reason category. */
